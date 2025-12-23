@@ -49,21 +49,28 @@ from adsData import (
 from qwenvl.dataset.rope2d import get_rope_index_25, get_rope_index_2
 from qwenvl.utils.token_utils import prepare_action_tokenizer_mapping
 
-# GT 生成工具
-sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'tools', 'pickle_gen'))
+# GT 生成工具 (同目录下)
 try:
-    from transfuser_gt_utils_ads import (
+    from .transfuser_gt_utils_ads import (
         ADSGTConfig,
         compute_agent_targets_ads,
         compute_bev_semantic_map_ads,
         visualize_bev_semantic_map,
     )
 except ImportError:
-    # 如果导入失败，提供 fallback
-    print("Warning: transfuser_gt_utils_ads not found, using inline implementation")
-    ADSGTConfig = None
-    compute_bev_semantic_map_ads = None
-    visualize_bev_semantic_map = None
+    # 如果相对导入失败，尝试绝对导入
+    try:
+        from transfuser_gt_utils_ads import (
+            ADSGTConfig,
+            compute_agent_targets_ads,
+            compute_bev_semantic_map_ads,
+            visualize_bev_semantic_map,
+        )
+    except ImportError:
+        print("Warning: transfuser_gt_utils_ads not found")
+        ADSGTConfig = None
+        compute_bev_semantic_map_ads = None
+        visualize_bev_semantic_map = None
 
 import moxing
 import torch.nn.functional as F
@@ -591,7 +598,6 @@ class LazySupervisedADSAgentBEVDataset(LazySupervisedHuawei2VAROSSMOEDataset_Mul
         )
         
         # ========== 生成 Agent targets ==========
-        from transfuser_gt_utils_ads import compute_agent_targets_ads
         agent_states, agent_labels = compute_agent_targets_ads(obj_label, self.gt_config)
         
         # ========== 可视化 ==========
