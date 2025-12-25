@@ -735,6 +735,111 @@ class LazySupervisedHuawei2VAROSSDataset(ADSData):
             return image_tensor, grid_thw, raw_vae_img_tensor
         return image_tensor, grid_thw
 
+    # ---------- BEV 可视化 helpers (最简实现) ----------
+    def _convert_object_feat_to_obj_label(self, object_feat):
+        """
+        将 ADS object_feat 转换为 obj_label 格式 (N, 11)
+        特征顺序: 0:x, 1:y, 2:heading, 3:class, 4:length, 5:width, 7:vel, 8:vel_orien
+        输出: [x, y, z, lx, ly, lz, heading, category, state, vx, vy]
+        """
+        if object_feat is None:
+            return None
+
+        feat = np.array(object_feat)
+        
+        # shape: (N, T, feat_dim) -> 取最后一帧
+        if feat.ndim == 3:
+            feat = feat[:, -1, :]
+        
+        if feat.shape[-1] < 9:
+            return None
+
+        N = feat.shape[0]
+        x = feat[:, 0]
+        y = feat[:, 1]
+        heading = feat[:, 2]
+        cls = feat[:, 3]
+        length = feat[:, 4]
+        width = feat[:, 5]
+        speed = feat[:, 7]
+        vel_orien = feat[:, 8]
+
+        vx = speed * np.cos(vel_orien)
+        vy = speed * np.sin(vel_orien)
+
+        # 过滤无效数据 (padding)
+        valid = ~((np.abs(x) < 1e-6) & (np.abs(y) < 1e-6))
+
+        obj_label = np.zeros((N, 11), dtype=np.float32)
+        obj_label[:, 0] = x
+        obj_label[:, 1] = y
+        obj_label[:, 2] = 0.0       # z
+        obj_label[:, 3] = length
+        obj_label[:, 4] = width
+        obj_label[:, 5] = 1.5       # height default
+        obj_label[:, 6] = heading
+        obj_label[:, 7] = cls
+        obj_label[:, 8] = 0.0       # state
+        obj_label[:, 9] = vx
+        obj_label[:, 10] = vy
+
+        return obj_label[valid]
+
+    def visualize_bev(self, cur_pkl_data, sample_id="debug"):
+        """
+        可视化 BEV semantic map (调试用)
+        """
+        if self.debug_bev_count >= self.debug_bev_max:
+            return None  # 达到上限，跳过
+            
+        from huawei_code.transfuser_gt_utils_ads import (
+            compute_bev_semantic_map_ads,
+            compute_agent_targets_ads,
+            visualize_bev_semantic_map,
+        )
+        
+        # 1. 转换 object_feat -> obj_label
+        object_feat = cur_pkl_data.get('object_feat', None)
+        obj_label = self._convert_object_feat_to_obj_label(object_feat)
+        
+        if obj_label is None or len(obj_label) == 0:
+            return None
+        
+        # 2. 获取静态物体 (车道线等)
+        static_obj_feat = cur_pkl_data.get('static_obj_feat', None)
+        static_obj_mask = cur_pkl_data.get('static_obj_mask', None)
+        
+        if static_obj_feat is not None:
+            static_obj_feat = np.array(static_obj_feat)
+        if static_obj_mask is not None:
+            static_obj_mask = np.array(static_obj_mask)
+        
+        # 3. 生成 BEV semantic map
+        bev_map = compute_bev_semantic_map_ads(
+            obj_labels=obj_label,
+            config=self.gt_config,
+            static_obj_feat=static_obj_feat,
+            static_obj_mask=static_obj_mask,
+        )
+        
+        # 4. 生成 Agent targets
+        agent_states, agent_labels = compute_agent_targets_ads(obj_label, self.gt_config)
+        
+        # 5. 可视化并保存
+        save_path = os.path.join(self.debug_save_dir, f"bev_{sample_id}.png")
+        visualize_bev_semantic_map(
+            bev_map=bev_map,
+            agent_states=agent_states,
+            agent_labels=agent_labels,
+            config=self.gt_config,
+            save_path=save_path,
+            title=f"Sample: {sample_id}",
+        )
+        
+        self.debug_bev_count += 1
+        rank0_print(f"[BEV Debug] Saved {save_path}, objects: {len(obj_label)}")
+        return save_path
+
     # ---------- Action helpers ----------
     def wrap_action_sequence(self, action_ids: List[int]) -> torch.Tensor:
         return torch.tensor([self.boa_token_id] + action_ids + [self.eoa_token_id], dtype=torch.long)
@@ -1016,6 +1121,26 @@ class LazySupervisedHuawei2VAROSSDataset_Multiview4(ADSData):
 
         rank0_print("Huawei2VA: frames_per_second=%d, action_hz=%d, gap_frames=%d" % (self.frames_per_second, self.action_hz, self.gap_frames))
 
+        # ========== BEV 可视化配置 (最简实现) ==========
+        self.debug_bev = getattr(data_args, "debug_bev", False)
+        self.debug_save_dir = getattr(data_args, "debug_save_dir", "/tmp/bev_debug")
+        self.debug_bev_count = 0  # 控制可视化数量
+        self.debug_bev_max = getattr(data_args, "debug_bev_max", 50)  # 最多保存50张
+        
+        if self.debug_bev:
+            from huawei_code.transfuser_gt_utils_ads import ADSGTConfig
+            self.gt_config = ADSGTConfig(
+                bev_pixel_width=256,
+                bev_pixel_height=128,
+                lidar_min_x=0.0,
+                lidar_max_x=32.0,
+                lidar_min_y=-32.0,
+                lidar_max_y=32.0,
+                use_fov_filter=False,  # 多视角不需要FOV过滤
+            )
+            os.makedirs(self.debug_save_dir, exist_ok=True)
+            rank0_print(f"[BEV Debug] Enabled, saving to {self.debug_save_dir}")
+
     def __len__(self):
         return len(self.data)
 
@@ -1050,6 +1175,111 @@ class LazySupervisedHuawei2VAROSSDataset_Multiview4(ADSData):
                 raw_vae_img_tensor = None
             return image_tensor, grid_thw, raw_vae_img_tensor
         return image_tensor, grid_thw
+
+    # ---------- BEV 可视化 helpers (最简实现) ----------
+    def _convert_object_feat_to_obj_label(self, object_feat):
+        """
+        将 ADS object_feat 转换为 obj_label 格式 (N, 11)
+        特征顺序: 0:x, 1:y, 2:heading, 3:class, 4:length, 5:width, 7:vel, 8:vel_orien
+        输出: [x, y, z, lx, ly, lz, heading, category, state, vx, vy]
+        """
+        if object_feat is None:
+            return None
+
+        feat = np.array(object_feat)
+        
+        # shape: (N, T, feat_dim) -> 取最后一帧
+        if feat.ndim == 3:
+            feat = feat[:, -1, :]
+        
+        if feat.shape[-1] < 9:
+            return None
+
+        N = feat.shape[0]
+        x = feat[:, 0]
+        y = feat[:, 1]
+        heading = feat[:, 2]
+        cls = feat[:, 3]
+        length = feat[:, 4]
+        width = feat[:, 5]
+        speed = feat[:, 7]
+        vel_orien = feat[:, 8]
+
+        vx = speed * np.cos(vel_orien)
+        vy = speed * np.sin(vel_orien)
+
+        # 过滤无效数据 (padding)
+        valid = ~((np.abs(x) < 1e-6) & (np.abs(y) < 1e-6))
+
+        obj_label = np.zeros((N, 11), dtype=np.float32)
+        obj_label[:, 0] = x
+        obj_label[:, 1] = y
+        obj_label[:, 2] = 0.0       # z
+        obj_label[:, 3] = length
+        obj_label[:, 4] = width
+        obj_label[:, 5] = 1.5       # height default
+        obj_label[:, 6] = heading
+        obj_label[:, 7] = cls
+        obj_label[:, 8] = 0.0       # state
+        obj_label[:, 9] = vx
+        obj_label[:, 10] = vy
+
+        return obj_label[valid]
+
+    def visualize_bev(self, cur_pkl_data, sample_id="debug"):
+        """
+        可视化 BEV semantic map (调试用)
+        """
+        if self.debug_bev_count >= self.debug_bev_max:
+            return None  # 达到上限，跳过
+            
+        from huawei_code.transfuser_gt_utils_ads import (
+            compute_bev_semantic_map_ads,
+            compute_agent_targets_ads,
+            visualize_bev_semantic_map,
+        )
+        
+        # 1. 转换 object_feat -> obj_label
+        object_feat = cur_pkl_data.get('object_feat', None)
+        obj_label = self._convert_object_feat_to_obj_label(object_feat)
+        
+        if obj_label is None or len(obj_label) == 0:
+            return None
+        
+        # 2. 获取静态物体 (车道线等)
+        static_obj_feat = cur_pkl_data.get('static_obj_feat', None)
+        static_obj_mask = cur_pkl_data.get('static_obj_mask', None)
+        
+        if static_obj_feat is not None:
+            static_obj_feat = np.array(static_obj_feat)
+        if static_obj_mask is not None:
+            static_obj_mask = np.array(static_obj_mask)
+        
+        # 3. 生成 BEV semantic map
+        bev_map = compute_bev_semantic_map_ads(
+            obj_labels=obj_label,
+            config=self.gt_config,
+            static_obj_feat=static_obj_feat,
+            static_obj_mask=static_obj_mask,
+        )
+        
+        # 4. 生成 Agent targets
+        agent_states, agent_labels = compute_agent_targets_ads(obj_label, self.gt_config)
+        
+        # 5. 可视化并保存
+        save_path = os.path.join(self.debug_save_dir, f"bev_{sample_id}.png")
+        visualize_bev_semantic_map(
+            bev_map=bev_map,
+            agent_states=agent_states,
+            agent_labels=agent_labels,
+            config=self.gt_config,
+            save_path=save_path,
+            title=f"Sample: {sample_id}",
+        )
+        
+        self.debug_bev_count += 1
+        rank0_print(f"[BEV Debug] Saved {save_path}, objects: {len(obj_label)}")
+        return save_path
 
     # ---------- Action helpers ----------
     def wrap_action_sequence(self, action_ids: List[int]) -> torch.Tensor:
@@ -1187,6 +1417,10 @@ class LazySupervisedHuawei2VAROSSDataset_Multiview4(ADSData):
         # pre_prompt = COMMAND_MAP[pre_prompt_raw]
         cur_tbt_prompt = self.build_tbt_features(cur_command_data["tbt_lane_feature_from_bag"][0], cur_command_data["tbt_feature_from_bag"][0])
         pre_tbt_prompt = self.build_tbt_features(pre_command_data["tbt_lane_feature_from_bag"][0], pre_command_data["tbt_feature_from_bag"][0])
+
+        # [BEV Debug] 可视化调用
+        if getattr(self, 'debug_bev', False) and cur_pkl_data is not None:
+            self.visualize_bev(cur_pkl_data, sample_id=f"{cur_idx}")
 
         # Images (pre, cur) with optional raw VAE support
         pre_image_raw = cur_image_raw = None
@@ -1406,6 +1640,26 @@ class LazySupervisedHuawei2VAROSSMOEDataset_Multiview4(ADSData):
 
         rank0_print("Huawei2VA: frames_per_second=%d, action_hz=%d, gap_frames=%d" % (self.frames_per_second, self.action_hz, self.gap_frames))
 
+        # ========== BEV 可视化配置 (最简实现) ==========
+        self.debug_bev = getattr(data_args, "debug_bev", False)
+        self.debug_save_dir = getattr(data_args, "debug_save_dir", "/tmp/bev_debug")
+        self.debug_bev_count = 0  # 控制可视化数量
+        self.debug_bev_max = getattr(data_args, "debug_bev_max", 50)  # 最多保存50张
+        
+        if self.debug_bev:
+            from huawei_code.transfuser_gt_utils_ads import ADSGTConfig
+            self.gt_config = ADSGTConfig(
+                bev_pixel_width=256,
+                bev_pixel_height=128,
+                lidar_min_x=0.0,
+                lidar_max_x=32.0,
+                lidar_min_y=-32.0,
+                lidar_max_y=32.0,
+                use_fov_filter=False,  # 多视角不需要FOV过滤
+            )
+            os.makedirs(self.debug_save_dir, exist_ok=True)
+            rank0_print(f"[BEV Debug] Enabled, saving to {self.debug_save_dir}")
+
     def __len__(self):
         return len(self.data)
     
@@ -1440,6 +1694,111 @@ class LazySupervisedHuawei2VAROSSMOEDataset_Multiview4(ADSData):
                 raw_vae_img_tensor = None
             return image_tensor, grid_thw, raw_vae_img_tensor
         return image_tensor, grid_thw
+
+    # ---------- BEV 可视化 helpers (最简实现) ----------
+    def _convert_object_feat_to_obj_label(self, object_feat):
+        """
+        将 ADS object_feat 转换为 obj_label 格式 (N, 11)
+        特征顺序: 0:x, 1:y, 2:heading, 3:class, 4:length, 5:width, 7:vel, 8:vel_orien
+        输出: [x, y, z, lx, ly, lz, heading, category, state, vx, vy]
+        """
+        if object_feat is None:
+            return None
+
+        feat = np.array(object_feat)
+        
+        # shape: (N, T, feat_dim) -> 取最后一帧
+        if feat.ndim == 3:
+            feat = feat[:, -1, :]
+        
+        if feat.shape[-1] < 9:
+            return None
+
+        N = feat.shape[0]
+        x = feat[:, 0]
+        y = feat[:, 1]
+        heading = feat[:, 2]
+        cls = feat[:, 3]
+        length = feat[:, 4]
+        width = feat[:, 5]
+        speed = feat[:, 7]
+        vel_orien = feat[:, 8]
+
+        vx = speed * np.cos(vel_orien)
+        vy = speed * np.sin(vel_orien)
+
+        # 过滤无效数据 (padding)
+        valid = ~((np.abs(x) < 1e-6) & (np.abs(y) < 1e-6))
+
+        obj_label = np.zeros((N, 11), dtype=np.float32)
+        obj_label[:, 0] = x
+        obj_label[:, 1] = y
+        obj_label[:, 2] = 0.0       # z
+        obj_label[:, 3] = length
+        obj_label[:, 4] = width
+        obj_label[:, 5] = 1.5       # height default
+        obj_label[:, 6] = heading
+        obj_label[:, 7] = cls
+        obj_label[:, 8] = 0.0       # state
+        obj_label[:, 9] = vx
+        obj_label[:, 10] = vy
+
+        return obj_label[valid]
+
+    def visualize_bev(self, cur_pkl_data, sample_id="debug"):
+        """
+        可视化 BEV semantic map (调试用)
+        """
+        if self.debug_bev_count >= self.debug_bev_max:
+            return None  # 达到上限，跳过
+            
+        from huawei_code.transfuser_gt_utils_ads import (
+            compute_bev_semantic_map_ads,
+            compute_agent_targets_ads,
+            visualize_bev_semantic_map,
+        )
+        
+        # 1. 转换 object_feat -> obj_label
+        object_feat = cur_pkl_data.get('object_feat', None)
+        obj_label = self._convert_object_feat_to_obj_label(object_feat)
+        
+        if obj_label is None or len(obj_label) == 0:
+            return None
+        
+        # 2. 获取静态物体 (车道线等)
+        static_obj_feat = cur_pkl_data.get('static_obj_feat', None)
+        static_obj_mask = cur_pkl_data.get('static_obj_mask', None)
+        
+        if static_obj_feat is not None:
+            static_obj_feat = np.array(static_obj_feat)
+        if static_obj_mask is not None:
+            static_obj_mask = np.array(static_obj_mask)
+        
+        # 3. 生成 BEV semantic map
+        bev_map = compute_bev_semantic_map_ads(
+            obj_labels=obj_label,
+            config=self.gt_config,
+            static_obj_feat=static_obj_feat,
+            static_obj_mask=static_obj_mask,
+        )
+        
+        # 4. 生成 Agent targets
+        agent_states, agent_labels = compute_agent_targets_ads(obj_label, self.gt_config)
+        
+        # 5. 可视化并保存
+        save_path = os.path.join(self.debug_save_dir, f"bev_{sample_id}.png")
+        visualize_bev_semantic_map(
+            bev_map=bev_map,
+            agent_states=agent_states,
+            agent_labels=agent_labels,
+            config=self.gt_config,
+            save_path=save_path,
+            title=f"Sample: {sample_id}",
+        )
+        
+        self.debug_bev_count += 1
+        rank0_print(f"[BEV Debug] Saved {save_path}, objects: {len(obj_label)}")
+        return save_path
 
     # ---------- Action helpers ----------
     def wrap_action_sequence(self, action_ids: List[int]) -> torch.Tensor:
@@ -1577,6 +1936,10 @@ class LazySupervisedHuawei2VAROSSMOEDataset_Multiview4(ADSData):
         # pre_prompt = COMMAND_MAP[pre_prompt_raw]
         cur_tbt_prompt = self.build_tbt_features(cur_command_data["tbt_lane_feature_from_bag"][0], cur_command_data["tbt_feature_from_bag"][0])
         pre_tbt_prompt = self.build_tbt_features(pre_command_data["tbt_lane_feature_from_bag"][0], pre_command_data["tbt_feature_from_bag"][0])
+
+        # [BEV Debug] 可视化调用
+        if getattr(self, 'debug_bev', False) and cur_pkl_data is not None:
+            self.visualize_bev(cur_pkl_data, sample_id=f"{cur_idx}")
 
         # Images (pre, cur) with optional raw VAE support
         pre_image_raw = cur_image_raw = None
