@@ -237,14 +237,18 @@ def compute_agent_targets_ads(
         box_length = obj[ADSObjectIndex.LX]
         box_width = obj[ADSObjectIndex.LY]
         obj_label_class = int(obj[ADSObjectIndex.LABEL])
-        
+
+        # 过滤掉 class 0 (UNKNOWN)
+        if obj_label_class == 0:
+            continue
+
         # 检查是否在范围内
         if not _in_range(box_x, box_y):
             continue
-        
+
         # 获取类别
         agent_class = ADS_LABEL_TO_AGENT_CLASS.get(obj_label_class, AgentClassIndex.OTHER)
-        
+
         agent_states_list.append(
             np.array([box_x, box_y, box_heading, box_length, box_width], dtype=np.float32)
         )
@@ -451,6 +455,10 @@ def compute_bev_semantic_map_ads(
         width = obj[ADSObjectIndex.LY]
         obj_class = int(obj[ADSObjectIndex.LABEL])
 
+        # 过滤掉 class 0 (UNKNOWN) - 不绘制
+        if obj_class == 0:
+            continue
+
         # 检查是否在范围内
         if not (config.lidar_min_x <= x <= config.lidar_max_x and
                 config.lidar_min_y <= y <= config.lidar_max_y):
@@ -461,7 +469,7 @@ def compute_bev_semantic_map_ads(
             bev_label = BEVClassIndex.VEHICLES
         elif obj_class in [7, 8, 9]:  # 行人和骑车人
             bev_label = BEVClassIndex.PEDESTRIANS
-        else:  # 0 (unknown), 10-11 (无人车辆) -> static
+        else:  # 10-11 (无人车辆/自行车) -> static
             bev_label = BEVClassIndex.STATIC_OBJECTS
 
         _draw_box_on_bev(bev_semantic_map, x, y, heading, length, width, bev_label, config)
@@ -547,7 +555,9 @@ def _draw_static_objects(
     scale: int = 1
 ) -> None:
     """
-    绘制静态物体轮廓 (作为填充多边形)
+    绘制静态物体轮廓 (作为 polylines，不是填充多边形)
+
+    注意: static_obj_feat 在华为数据中包含车道线等，应该画成线条
 
     Args:
         static_feat: shape (N, P, 2) - N个静态物体，每个有P个点
@@ -558,23 +568,26 @@ def _draw_static_objects(
     else:
         valid = static_mask.astype(bool)
 
+    thickness = max(1, config.lane_line_thickness * scale)
+
     for i in range(static_feat.shape[0]):
         if i >= len(valid) or not valid[i]:
             continue
 
         points = static_feat[i]  # (P, 2)
 
-        # 过滤无效点
-        valid_mask = np.linalg.norm(points, axis=-1) > 0.01
+        # 过滤无效点 (mean == 0 表示无效)
+        valid_mask = np.abs(points).sum(axis=-1) > 0.01
         valid_points = points[valid_mask]
-        if len(valid_points) < 3:  # 多边形至少需要3个点
+        if len(valid_points) < 2:
             continue
 
         # 转换为像素坐标
         pixel_coords = _world_to_pixel_array(valid_points, config, scale)
 
-        # 绘制填充多边形
-        cv2.fillPoly(bev_map, [pixel_coords], color=int(label))
+        # 绘制 polylines (不是填充多边形!)
+        cv2.polylines(bev_map, [pixel_coords], isClosed=False,
+                      color=int(label), thickness=thickness)
 
 
 # ============ 简化版：仅使用 obj_labels ============
@@ -616,19 +629,22 @@ def compute_bev_semantic_map_ads_simple(
 
         x = obj[ADSObjectIndex.X]
         y = obj[ADSObjectIndex.Y]
+        obj_class = int(obj[ADSObjectIndex.LABEL])
+
+        # 过滤掉 class 0 (UNKNOWN)
+        if obj_class == 0:
+            continue
 
         # 检查是否在范围内
         if not (config.lidar_min_x <= x <= config.lidar_max_x and
                 config.lidar_min_y <= y <= config.lidar_max_y):
             continue
 
-        obj_class = int(obj[ADSObjectIndex.LABEL])
-
         if obj_class in [1, 2, 3, 4, 5, 6]:
             vehicles.append(obj)
         elif obj_class in [7, 8, 9]:
             pedestrians.append(obj)
-        else:
+        else:  # 10-11
             static_objs.append(obj)
 
     # 按顺序绘制: static -> vehicle -> pedestrian

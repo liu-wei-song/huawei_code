@@ -736,41 +736,35 @@ class LazySupervisedHuawei2VAROSSDataset(ADSData):
         return image_tensor, grid_thw
 
     # ---------- BEV 可视化 helpers (最简实现) ----------
-    def _convert_object_feat_to_obj_label(self, object_feat):
+    def _convert_object_feat_to_obj_label(self, object_feat, exclude_ego=True):
         """
         将 ADS object_feat 转换为 obj_label 格式 (N, 11)
         特征顺序: 0:x, 1:y, 2:heading, 3:class, 4:length, 5:width, 7:vel, 8:vel_orien
         输出: [x, y, z, lx, ly, lz, heading, category, state, vx, vy]
+
+        注意: object_feat[0] 是 ego 车，默认排除
         """
         if object_feat is None:
             return None
 
         feat = np.array(object_feat)
-        
-        # shape: (N, T, feat_dim) -> 取当前帧
-        # 注意: T维度通常是 [历史...当前...未来], 最后几帧可能是0(padding)
-        # 根据数据结构, 当前帧通常在中间位置, 尝试多种策略找到有效帧
+
+        # shape: (N, T, feat_dim) -> 取最后一帧 (当前帧)
+        # 根据华为数据: obj_feat[0, -1, :] 是 ego 车
         if feat.ndim == 3:
-            T = feat.shape[1]
-            # 策略1: 尝试取中间帧 (当前帧通常在这里)
-            mid_idx = T // 2
-            # 策略2: 如果中间帧也是0, 尝试找第一个非零帧
-            candidate_indices = [mid_idx, 0, T-1]  # 优先中间, 然后开头, 最后结尾
-            
-            for idx in candidate_indices:
-                test_feat = feat[:, idx, :]
-                # 检查是否有非零数据 (x,y坐标不全为0)
-                if np.any(np.abs(test_feat[:, 0]) > 1e-6) or np.any(np.abs(test_feat[:, 1]) > 1e-6):
-                    feat = test_feat
-                    break
-            else:
-                # 所有候选都是0, 返回None
-                return None
-        
+            feat = feat[:, -1, :]  # 取最后一帧
+
         if feat.shape[-1] < 9:
             return None
 
+        # 排除 ego 车 (第一个物体)
+        if exclude_ego and feat.shape[0] > 1:
+            feat = feat[1:]  # 排除 index=0 的 ego
+
         N = feat.shape[0]
+        if N == 0:
+            return None
+
         x = feat[:, 0]
         y = feat[:, 1]
         heading = feat[:, 2]
@@ -783,7 +777,7 @@ class LazySupervisedHuawei2VAROSSDataset(ADSData):
         vx = speed * np.cos(vel_orien)
         vy = speed * np.sin(vel_orien)
 
-        # 过滤无效数据 (padding)
+        # 过滤无效数据 (padding: x,y 都接近0)
         valid = ~((np.abs(x) < 1e-6) & (np.abs(y) < 1e-6))
 
         obj_label = np.zeros((N, 11), dtype=np.float32)
@@ -1187,25 +1181,34 @@ class LazySupervisedHuawei2VAROSSDataset_Multiview4(ADSData):
         return image_tensor, grid_thw
 
     # ---------- BEV 可视化 helpers (最简实现) ----------
-    def _convert_object_feat_to_obj_label(self, object_feat):
+    def _convert_object_feat_to_obj_label(self, object_feat, exclude_ego=True):
         """
         将 ADS object_feat 转换为 obj_label 格式 (N, 11)
         特征顺序: 0:x, 1:y, 2:heading, 3:class, 4:length, 5:width, 7:vel, 8:vel_orien
         输出: [x, y, z, lx, ly, lz, heading, category, state, vx, vy]
+
+        注意: object_feat[0] 是 ego 车，默认排除
         """
         if object_feat is None:
             return None
 
         feat = np.array(object_feat)
-        
-        # shape: (N, T, feat_dim) -> 取最后一帧
+
+        # shape: (N, T, feat_dim) -> 取最后一帧 (当前帧)
         if feat.ndim == 3:
             feat = feat[:, -1, :]
-        
+
         if feat.shape[-1] < 9:
             return None
 
+        # 排除 ego 车 (第一个物体)
+        if exclude_ego and feat.shape[0] > 1:
+            feat = feat[1:]
+
         N = feat.shape[0]
+        if N == 0:
+            return None
+
         x = feat[:, 0]
         y = feat[:, 1]
         heading = feat[:, 2]
@@ -1242,29 +1245,29 @@ class LazySupervisedHuawei2VAROSSDataset_Multiview4(ADSData):
         """
         if self.debug_bev_count >= self.debug_bev_max:
             return None  # 达到上限，跳过
-            
+
         from huawei_code.transfuser_gt_utils_ads import (
             compute_bev_semantic_map_ads,
             compute_agent_targets_ads,
             visualize_bev_semantic_map,
         )
-        
-        # 1. 转换 object_feat -> obj_label
+
+        # 1. 转换 object_feat -> obj_label (排除 ego)
         object_feat = cur_pkl_data.get('object_feat', None)
-        obj_label = self._convert_object_feat_to_obj_label(object_feat)
-        
+        obj_label = self._convert_object_feat_to_obj_label(object_feat, exclude_ego=True)
+
         if obj_label is None or len(obj_label) == 0:
             return None
-        
+
         # 2. 获取静态物体 (车道线等)
         static_obj_feat = cur_pkl_data.get('static_obj_feat', None)
         static_obj_mask = cur_pkl_data.get('static_obj_mask', None)
-        
+
         if static_obj_feat is not None:
             static_obj_feat = np.array(static_obj_feat)
         if static_obj_mask is not None:
             static_obj_mask = np.array(static_obj_mask)
-        
+
         # 3. 生成 BEV semantic map
         bev_map = compute_bev_semantic_map_ads(
             obj_labels=obj_label,
@@ -1272,10 +1275,10 @@ class LazySupervisedHuawei2VAROSSDataset_Multiview4(ADSData):
             static_obj_feat=static_obj_feat,
             static_obj_mask=static_obj_mask,
         )
-        
+
         # 4. 生成 Agent targets
         agent_states, agent_labels = compute_agent_targets_ads(obj_label, self.gt_config)
-        
+
         # 5. 可视化并保存
         save_path = os.path.join(self.debug_save_dir, f"bev_{sample_id}.png")
         visualize_bev_semantic_map(
@@ -1286,7 +1289,7 @@ class LazySupervisedHuawei2VAROSSDataset_Multiview4(ADSData):
             save_path=save_path,
             title=f"Sample: {sample_id}",
         )
-        
+
         self.debug_bev_count += 1
         rank0_print(f"[BEV Debug] Saved {save_path}, objects: {len(obj_label)}")
         return save_path
@@ -1706,25 +1709,34 @@ class LazySupervisedHuawei2VAROSSMOEDataset_Multiview4(ADSData):
         return image_tensor, grid_thw
 
     # ---------- BEV 可视化 helpers (最简实现) ----------
-    def _convert_object_feat_to_obj_label(self, object_feat):
+    def _convert_object_feat_to_obj_label(self, object_feat, exclude_ego=True):
         """
         将 ADS object_feat 转换为 obj_label 格式 (N, 11)
         特征顺序: 0:x, 1:y, 2:heading, 3:class, 4:length, 5:width, 7:vel, 8:vel_orien
         输出: [x, y, z, lx, ly, lz, heading, category, state, vx, vy]
+
+        注意: object_feat[0] 是 ego 车，默认排除
         """
         if object_feat is None:
             return None
 
         feat = np.array(object_feat)
-        
-        # shape: (N, T, feat_dim) -> 取最后一帧
+
+        # shape: (N, T, feat_dim) -> 取最后一帧 (当前帧)
         if feat.ndim == 3:
             feat = feat[:, -1, :]
-        
+
         if feat.shape[-1] < 9:
             return None
 
+        # 排除 ego 车 (第一个物体)
+        if exclude_ego and feat.shape[0] > 1:
+            feat = feat[1:]
+
         N = feat.shape[0]
+        if N == 0:
+            return None
+
         x = feat[:, 0]
         y = feat[:, 1]
         heading = feat[:, 2]
@@ -1761,29 +1773,29 @@ class LazySupervisedHuawei2VAROSSMOEDataset_Multiview4(ADSData):
         """
         if self.debug_bev_count >= self.debug_bev_max:
             return None  # 达到上限，跳过
-            
+
         from huawei_code.transfuser_gt_utils_ads import (
             compute_bev_semantic_map_ads,
             compute_agent_targets_ads,
             visualize_bev_semantic_map,
         )
-        
-        # 1. 转换 object_feat -> obj_label
+
+        # 1. 转换 object_feat -> obj_label (排除 ego)
         object_feat = cur_pkl_data.get('object_feat', None)
-        obj_label = self._convert_object_feat_to_obj_label(object_feat)
-        
+        obj_label = self._convert_object_feat_to_obj_label(object_feat, exclude_ego=True)
+
         if obj_label is None or len(obj_label) == 0:
             return None
-        
+
         # 2. 获取静态物体 (车道线等)
         static_obj_feat = cur_pkl_data.get('static_obj_feat', None)
         static_obj_mask = cur_pkl_data.get('static_obj_mask', None)
-        
+
         if static_obj_feat is not None:
             static_obj_feat = np.array(static_obj_feat)
         if static_obj_mask is not None:
             static_obj_mask = np.array(static_obj_mask)
-        
+
         # 3. 生成 BEV semantic map
         bev_map = compute_bev_semantic_map_ads(
             obj_labels=obj_label,
@@ -1791,10 +1803,10 @@ class LazySupervisedHuawei2VAROSSMOEDataset_Multiview4(ADSData):
             static_obj_feat=static_obj_feat,
             static_obj_mask=static_obj_mask,
         )
-        
+
         # 4. 生成 Agent targets
         agent_states, agent_labels = compute_agent_targets_ads(obj_label, self.gt_config)
-        
+
         # 5. 可视化并保存
         save_path = os.path.join(self.debug_save_dir, f"bev_{sample_id}.png")
         visualize_bev_semantic_map(
@@ -1805,7 +1817,7 @@ class LazySupervisedHuawei2VAROSSMOEDataset_Multiview4(ADSData):
             save_path=save_path,
             title=f"Sample: {sample_id}",
         )
-        
+
         self.debug_bev_count += 1
         rank0_print(f"[BEV Debug] Saved {save_path}, objects: {len(obj_label)}")
         return save_path
