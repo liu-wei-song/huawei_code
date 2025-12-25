@@ -747,9 +747,25 @@ class LazySupervisedHuawei2VAROSSDataset(ADSData):
 
         feat = np.array(object_feat)
         
-        # shape: (N, T, feat_dim) -> 取最后一帧
+        # shape: (N, T, feat_dim) -> 取当前帧
+        # 注意: T维度通常是 [历史...当前...未来], 最后几帧可能是0(padding)
+        # 根据数据结构, 当前帧通常在中间位置, 尝试多种策略找到有效帧
         if feat.ndim == 3:
-            feat = feat[:, -1, :]
+            T = feat.shape[1]
+            # 策略1: 尝试取中间帧 (当前帧通常在这里)
+            mid_idx = T // 2
+            # 策略2: 如果中间帧也是0, 尝试找第一个非零帧
+            candidate_indices = [mid_idx, 0, T-1]  # 优先中间, 然后开头, 最后结尾
+            
+            for idx in candidate_indices:
+                test_feat = feat[:, idx, :]
+                # 检查是否有非零数据 (x,y坐标不全为0)
+                if np.any(np.abs(test_feat[:, 0]) > 1e-6) or np.any(np.abs(test_feat[:, 1]) > 1e-6):
+                    feat = test_feat
+                    break
+            else:
+                # 所有候选都是0, 返回None
+                return None
         
         if feat.shape[-1] < 9:
             return None
@@ -1130,13 +1146,7 @@ class LazySupervisedHuawei2VAROSSDataset_Multiview4(ADSData):
         if self.debug_bev:
             from huawei_code.transfuser_gt_utils_ads import ADSGTConfig
             self.gt_config = ADSGTConfig(
-                bev_pixel_width=256,
-                bev_pixel_height=128,
-                lidar_min_x=0.0,
-                lidar_max_x=32.0,
-                lidar_min_y=-32.0,
-                lidar_max_y=32.0,
-                use_fov_filter=False,  # 多视角不需要FOV过滤
+                vis_scale=8
             )
             os.makedirs(self.debug_save_dir, exist_ok=True)
             rank0_print(f"[BEV Debug] Enabled, saving to {self.debug_save_dir}")
