@@ -5,19 +5,32 @@ ADS Data 专用 GT Label 生成工具
 与 NavSim 版本的区别：
 1. 不依赖 nuplan 地图 API
 2. 使用 ADS 数据格式 (obj_label, static_obj_feat, curb_feat)
-3. 类别数量更少 (无 centerline)
+3. Ego 在中心，前后左右对称
 
-BEV 类别定义 (4类):
+BEV 类别定义 (5类):
     0: background
-    1: static_objects (barriers, cones等)
-    2: vehicles
-    3: pedestrians
+    1: lane_lines (车道线)
+    2: static_objects (barriers, cones等)
+    3: vehicles
+    4: pedestrians
 
 Agent 类别定义 (4类):
     0: empty
     1: vehicle
     2: pedestrian
     3: other
+
+重要说明：
+- 训练数据 (compute_bev_semantic_map_ads): 纯语义图 (uint8)，无装饰元素
+  * 尺寸: 256x256 (默认)
+  * 格式: 单通道 uint8，值为 0-4 的类别索引
+  * 不包含：网格、图例、坐标轴、文字等任何可视化元素
+  
+- 可视化 (visualize_bev_semantic_map): 彩色渲染图，用于人眼查看
+  * 尺寸: 1024x1024 (默认高分辨率)
+  * 格式: 三通道 BGR 彩色图
+  * 可选装饰：网格、图例、距离标注等（通过参数控制）
+  * 不包含：坐标轴（已移除）
 """
 
 import numpy as np
@@ -89,48 +102,62 @@ ADS_LABEL_TO_AGENT_CLASS = {
 
 # ============ BEV 类别定义 ============
 class BEVClassIndex(IntEnum):
-    """BEV 语义图类别定义 (4类，无 centerline)"""
+    """BEV 语义图类别定义 (5类)"""
     BACKGROUND = 0
-    STATIC_OBJECTS = 1
-    VEHICLES = 2
-    PEDESTRIANS = 3
+    LANE_LINES = 1       # 车道线
+    STATIC_OBJECTS = 2   # 静态物体 (barriers, cones等)
+    VEHICLES = 3         # 车辆
+    PEDESTRIANS = 4      # 行人
 
 
 @dataclass
 class ADSGTConfig:
     """ADS GT生成配置"""
-    # 范围 (米)
-    # NOTE: default to a front BEV frame (x in [0, 32]) with y in [-32, 32],
-    # matching bev_pixel_height=128, bev_pixel_size=0.25 -> 32m forward.
-    lidar_min_x: float = 0.0
+    # 范围 (米) - ego-centric，ego在中心
+    # 默认: 前后各32m，左右各32m
+    lidar_min_x: float = -32.0
     lidar_max_x: float = 32.0
     lidar_min_y: float = -32.0
     lidar_max_y: float = 32.0
-    
+
     # Agent detection
     num_bounding_boxes: int = 20
-    
+
     # FOV 限制 (用于只有front view的情况)
-    use_fov_filter: bool = True
+    use_fov_filter: bool = False  # 默认关闭，因为ego在中间需要看四周
     fov_angle_deg: float = 60.0  # 总FOV角度 (左右各30度)
-    
-    # BEV尺寸
+
+    # BEV训练尺寸 (用于训练的语义图)
     bev_pixel_width: int = 256
-    bev_pixel_height: int = 128
+    bev_pixel_height: int = 256  # 正方形，前后对称
     bev_pixel_size: float = 0.25  # 每像素对应的米数
-    
+
+    # 可视化分辨率 (高分辨率用于可视化)
+    vis_scale: int = 4  # 可视化放大倍数
+
     # BEV类别数
-    num_bev_classes: int = 4  # background + static + vehicle + pedestrian
-    
+    num_bev_classes: int = 5  # background + lane + static + vehicle + pedestrian
+
+    # 车道线绘制参数
+    lane_line_thickness: int = 2  # 训练用的线宽
+    static_line_thickness: int = 2  # 静态物体线宽
+
     @property
     def bev_semantic_frame(self) -> Tuple[int, int]:
+        """训练用的BEV尺寸"""
         return (self.bev_pixel_height, self.bev_pixel_width)
-    
+
+    @property
+    def bev_vis_frame(self) -> Tuple[int, int]:
+        """可视化用的高分辨率BEV尺寸"""
+        return (self.bev_pixel_height * self.vis_scale,
+                self.bev_pixel_width * self.vis_scale)
+
     @property
     def bev_radius(self) -> float:
         values = [self.lidar_min_x, self.lidar_max_x, self.lidar_min_y, self.lidar_max_y]
         return max([abs(value) for value in values])
-    
+
     @property
     def fov_half_angle_rad(self) -> float:
         return math.radians(self.fov_angle_deg / 2.0)
@@ -211,14 +238,14 @@ def compute_agent_targets_ads(
         box_length = obj[ADSObjectIndex.LX]
         box_width = obj[ADSObjectIndex.LY]
         obj_label_class = int(obj[ADSObjectIndex.LABEL])
-        
+
         # 检查是否在范围内
         if not _in_range(box_x, box_y):
             continue
-        
+
         # 获取类别
         agent_class = ADS_LABEL_TO_AGENT_CLASS.get(obj_label_class, AgentClassIndex.OTHER)
-        
+
         agent_states_list.append(
             np.array([box_x, box_y, box_heading, box_length, box_width], dtype=np.float32)
         )
@@ -247,35 +274,60 @@ def compute_agent_targets_ads(
 
 # ============ BEV Semantic Map 生成 ============
 
-def _coords_to_pixel(coords: npt.NDArray, config: ADSGTConfig) -> npt.NDArray[np.int32]:
+def _world_to_pixel(x: float, y: float, config: ADSGTConfig, scale: int = 1) -> Tuple[int, int]:
     """
-    将局部坐标转换为 BEV 图像像素坐标
-    与 vis_utils.py 中的 draw_static_obj_bev 保持一致
+    将世界坐标转换为 BEV 图像像素坐标 (ego在中心)
 
-    坐标系:
-        - 车辆 x (前方) -> 图像 v (行，向上为负)
-        - 车辆 y (左方) -> 图像 u (列，向左为负)
+    坐标系定义:
+    - 世界坐标: x正向前，y正向左
+    - 图像坐标: row向下增加，col向右增加
+    - ego在图像中心
 
     Args:
-        coords: shape (..., 2) - [x, y] 格式，单位为米
-        config: ADSGTConfig
+        x, y: 世界坐标 (米)
+        config: 配置
+        scale: 分辨率放大倍数 (用于高分辨率可视化)
 
     Returns:
-        pixel_coords: shape (..., 2) - [u, v] 格式，即 [列, 行]
+        (col, row): OpenCV格式的像素坐标
     """
-    H, W = config.bev_semantic_frame  # (128, 256)
-    # 自车位置在图像底部中心
-    center_u = W // 2   # 128
-    center_v = H - 1    # 127 (底部)
-    meter_pix_scale = 1.0 / config.bev_pixel_size  # 每米对应的像素数
+    H = config.bev_pixel_height * scale
+    W = config.bev_pixel_width * scale
+    pixel_size = config.bev_pixel_size / scale
 
-    x = coords[..., 0]  # 前方距离
-    y = coords[..., 1]  # 左右距离
+    # ego在图像中心
+    # x正向前 -> 图像向上 -> row减小
+    # y正向左 -> 图像向左 -> col减小
+    row = int(H / 2 - x / pixel_size)
+    col = int(W / 2 - y / pixel_size)
 
-    u = center_u - y * meter_pix_scale  # 图像列
-    v = center_v - x * meter_pix_scale  # 图像行
+    return (col, row)  # OpenCV格式 (x, y) = (col, row)
 
-    pixel_coords = np.stack([u, v], axis=-1).astype(np.int32)
+
+def _world_to_pixel_array(coords: npt.NDArray, config: ADSGTConfig, scale: int = 1) -> npt.NDArray[np.int32]:
+    """
+    批量将世界坐标转换为像素坐标
+
+    Args:
+        coords: shape (N, 2) - [x, y] 世界坐标
+        config: 配置
+        scale: 分辨率放大倍数
+
+    Returns:
+        pixel_coords: shape (N, 1, 2) - OpenCV格式 [col, row]
+    """
+    H = config.bev_pixel_height * scale
+    W = config.bev_pixel_width * scale
+    pixel_size = config.bev_pixel_size / scale
+
+    x = coords[:, 0]
+    y = coords[:, 1]
+
+    row = (H / 2 - x / pixel_size).astype(np.int32)
+    col = (W / 2 - y / pixel_size).astype(np.int32)
+
+    # OpenCV需要 (N, 1, 2) 格式，每个点是 [col, row]
+    pixel_coords = np.stack([col, row], axis=-1).reshape(-1, 1, 2)
     return pixel_coords
 
 
@@ -284,41 +336,98 @@ def _draw_box_on_bev(
     x: float, y: float, heading: float,
     length: float, width: float,
     label: int,
-    config: ADSGTConfig
+    config: ADSGTConfig,
+    scale: int = 1
 ) -> None:
     """
-    在 BEV 图上绘制一个填充的 box
-    """
-    # 计算box的四个角点 (局部坐标)
-    cos_h = np.cos(heading)
-    sin_h = np.sin(heading)
+    在 BEV 图上绘制一个填充的旋转 bounding box
 
-    # 四个角点相对于中心的偏移
+    Args:
+        bev_map: BEV语义图 (会被原地修改)
+        x, y: 物体中心的世界坐标
+        heading: 航向角 (弧度)
+        length: 长度 (x方向)
+        width: 宽度 (y方向)
+        label: 类别标签
+        config: 配置
+        scale: 分辨率放大倍数
+    """
+    # 计算box的四个角点 (相对于物体中心的偏移)
     half_l = length / 2
     half_w = width / 2
 
-    corners = np.array([
-        [ half_l,  half_w],
-        [ half_l, -half_w],
-        [-half_l, -half_w],
-        [-half_l,  half_w],
+    # 四个角点 (物体坐标系)
+    corners_local = np.array([
+        [ half_l,  half_w],  # 前左
+        [ half_l, -half_w],  # 前右
+        [-half_l, -half_w],  # 后右
+        [-half_l,  half_w],  # 后左
     ])
 
-    # 旋转
+    # 旋转矩阵
+    cos_h = np.cos(heading)
+    sin_h = np.sin(heading)
     rot_matrix = np.array([[cos_h, -sin_h], [sin_h, cos_h]])
-    rotated_corners = corners @ rot_matrix.T
 
-    # 平移到物体位置
-    rotated_corners[:, 0] += x
-    rotated_corners[:, 1] += y
+    # 旋转并平移到世界坐标
+    corners_world = corners_local @ rot_matrix.T
+    corners_world[:, 0] += x
+    corners_world[:, 1] += y
 
-    # 转换为像素坐标 [u, v] 格式
-    pixel_coords = _coords_to_pixel(rotated_corners, config)
+    # 转换为像素坐标
+    pixel_coords = _world_to_pixel_array(corners_world, config, scale)
 
     # 绘制填充多边形
-    # OpenCV fillPoly 需要 shape (N, 1, 2) 格式
-    pts = pixel_coords.reshape((-1, 1, 2))
-    cv2.fillPoly(bev_map, [pts], color=int(label))
+    cv2.fillPoly(bev_map, [pixel_coords], color=int(label))
+
+
+def _draw_polylines(
+    bev_map: npt.NDArray[np.uint8],
+    feat: npt.NDArray,
+    mask: npt.NDArray,
+    label: int,
+    config: ADSGTConfig,
+    thickness: int = 2,
+    scale: int = 1,
+    closed: bool = False
+) -> None:
+    """
+    通用的多段线绘制函数
+
+    Args:
+        bev_map: BEV语义图
+        feat: shape (N, P, 2) - N条线，每条有P个点 [x, y]
+        mask: shape (N, ...) - 有效性mask
+        label: 类别标签
+        config: 配置
+        thickness: 线宽
+        scale: 分辨率放大倍数
+        closed: 是否闭合
+    """
+    # 处理 mask
+    if mask.ndim >= 2:
+        valid = mask[..., -1].astype(bool)
+    else:
+        valid = mask.astype(bool)
+
+    for i in range(feat.shape[0]):
+        if i >= len(valid) or not valid[i]:
+            continue
+
+        points = feat[i]  # (P, 2)
+
+        # 过滤无效点 (距离太小的点视为padding)
+        valid_mask = np.linalg.norm(points, axis=-1) > 0.01
+        valid_points = points[valid_mask]
+        if len(valid_points) < 2:
+            continue
+
+        # 转换为像素坐标
+        pixel_coords = _world_to_pixel_array(valid_points, config, scale)
+
+        # 绘制线条
+        cv2.polylines(bev_map, [pixel_coords], isClosed=closed,
+                      color=int(label), thickness=max(1, thickness * scale))
 
 
 def compute_bev_semantic_map_ads(
@@ -331,146 +440,75 @@ def compute_bev_semantic_map_ads(
     curb_mask: Optional[npt.NDArray] = None,
 ) -> npt.NDArray[np.uint8]:
     """
-    从 ADS 数据计算 BEV Semantic Map
-    
+    从 ADS 数据计算 BEV Semantic Map (ego在中心)
+
     类别定义:
         0: background
-        1: static_objects (barriers, cones等)
-        2: vehicles
-        3: pedestrians
-    
+        1: lane_lines (车道线，从 static_obj_feat 提取)
+        2: static_objects (barriers, cones等)
+        3: vehicles
+        4: pedestrians
+
     Args:
         obj_labels: shape (N, 11) - 动态物体
         config: 配置
         valid_mask: shape (N,) - 有效物体的 mask (可选)
-        static_obj_feat: shape (M, P, 2) - 静态物体轮廓点
+        static_obj_feat: shape (M, P, 2) - 静态物体轮廓点 (包含车道线)
         static_obj_mask: shape (M, ...) - 静态物体 mask
         curb_feat: shape (K, P, 2) - 路缘点
         curb_mask: shape (K, ...) - 路缘 mask
-        
+
     Returns:
-        bev_semantic_map: shape (128, 256) - 语义分割图
+        bev_semantic_map: shape (H, W) - 语义分割图
     """
     if config is None:
         config = ADSGTConfig()
-    
+
     bev_semantic_map = np.zeros(config.bev_semantic_frame, dtype=np.uint8)
-    
-    # 1. 绘制静态物体 (如果有)
+
+    # 1. 绘制车道线 (从 static_obj_feat 提取，作为 LANE_LINES)
     if static_obj_feat is not None and static_obj_mask is not None:
-        _draw_static_objects(bev_semantic_map, static_obj_feat, static_obj_mask, 
-                           BEVClassIndex.STATIC_OBJECTS, config)
-    
-    # 2. 绘制路缘 (作为静态物体的一部分)
+        _draw_polylines(bev_semantic_map, static_obj_feat, static_obj_mask,
+                        BEVClassIndex.LANE_LINES, config,
+                        thickness=config.lane_line_thickness)
+
+    # 2. 绘制路缘 (作为 STATIC_OBJECTS)
     if curb_feat is not None and curb_mask is not None:
-        _draw_curb_lines(bev_semantic_map, curb_feat, curb_mask, 
-                        BEVClassIndex.STATIC_OBJECTS, config)
-    
-    # 3. 绘制动态物体 (车辆和行人)
+        _draw_polylines(bev_semantic_map, curb_feat, curb_mask,
+                        BEVClassIndex.STATIC_OBJECTS, config,
+                        thickness=config.static_line_thickness)
+
+    # 3. 绘制动态物体 (车辆和行人，优先级最高)
     for i, obj in enumerate(obj_labels):
-        # 检查是否无效
         if _is_invalid_obj_label_row(obj):
             continue
-        
+
         if valid_mask is not None and not valid_mask[i]:
             continue
-        
+
         x = obj[ADSObjectIndex.X]
         y = obj[ADSObjectIndex.Y]
         heading = obj[ADSObjectIndex.HEADING]
         length = obj[ADSObjectIndex.LX]
         width = obj[ADSObjectIndex.LY]
         obj_class = int(obj[ADSObjectIndex.LABEL])
-        
+
         # 检查是否在范围内
         if not (config.lidar_min_x <= x <= config.lidar_max_x and
                 config.lidar_min_y <= y <= config.lidar_max_y):
             continue
-        
+
         # 确定 BEV 类别 (根据 ADS FusionClassification)
         if obj_class in [1, 2, 3, 4, 5, 6]:  # 各类车辆
             bev_label = BEVClassIndex.VEHICLES
         elif obj_class in [7, 8, 9]:  # 行人和骑车人
             bev_label = BEVClassIndex.PEDESTRIANS
-        else:  # 0 (unknown), 10-11 (无人车辆) -> static
+        else:  # 0 (unknown), 10-11 (无人车辆/自行车) -> static
             bev_label = BEVClassIndex.STATIC_OBJECTS
-        
+
         _draw_box_on_bev(bev_semantic_map, x, y, heading, length, width, bev_label, config)
-    
+
     return bev_semantic_map
-
-
-def _draw_static_objects(
-    bev_map: npt.NDArray[np.uint8],
-    static_feat: npt.NDArray,
-    static_mask: npt.NDArray,
-    label: int,
-    config: ADSGTConfig
-) -> None:
-    """
-    绘制静态物体轮廓（车道线等）
-
-    Args:
-        static_feat: shape (N, P, 2) - N个静态物体，每个有P个点，格式 [x, y]
-    """
-    # 处理 mask (取最后一维)
-    if static_mask.ndim >= 2:
-        valid = static_mask[..., -1].astype(bool)
-    else:
-        valid = static_mask.astype(bool)
-
-    for i in range(static_feat.shape[0]):
-        if not valid[i]:
-            continue
-
-        points = static_feat[i]  # (P, 2)
-
-        # 过滤无效点
-        valid_points = points[np.linalg.norm(points, axis=-1) > 0.01]
-        if len(valid_points) < 2:
-            continue
-
-        # 转换为像素坐标 [u, v] 格式
-        pixel_coords = _coords_to_pixel(valid_points, config)
-
-        # 绘制多边形线条
-        pts = pixel_coords.reshape((-1, 1, 2))
-        cv2.polylines(bev_map, [pts], isClosed=False, color=int(label), thickness=2)
-
-
-def _draw_curb_lines(
-    bev_map: npt.NDArray[np.uint8],
-    curb_feat: npt.NDArray,
-    curb_mask: npt.NDArray,
-    label: int,
-    config: ADSGTConfig
-) -> None:
-    """
-    绘制路缘线
-    """
-    # 处理 mask (取最后一维)
-    if curb_mask.ndim >= 2:
-        valid = curb_mask[..., -1].astype(bool)
-    else:
-        valid = curb_mask.astype(bool)
-
-    for i in range(curb_feat.shape[0]):
-        if not valid[i]:
-            continue
-
-        points = curb_feat[i]  # (P, 2)
-
-        # 过滤无效点
-        valid_points = points[np.linalg.norm(points, axis=-1) > 0.01]
-        if len(valid_points) < 2:
-            continue
-
-        # 转换为像素坐标 [u, v] 格式
-        pixel_coords = _coords_to_pixel(valid_points, config)
-
-        # 绘制线条
-        pts = pixel_coords.reshape((-1, 1, 2))
-        cv2.polylines(bev_map, [pts], isClosed=False, color=int(label), thickness=1)
 
 
 # ============ 简化版：仅使用 obj_labels ============
@@ -481,74 +519,70 @@ def compute_bev_semantic_map_ads_simple(
 ) -> npt.NDArray[np.uint8]:
     """
     从 ADS obj_label 计算 BEV Semantic Map (简化版，仅使用动态物体)
-    
+
     类别定义:
         0: background
-        1: static_objects (其他类型)
-        2: vehicles
-        3: pedestrians
-    
+        1: lane_lines (简化版无此类)
+        2: static_objects (其他类型)
+        3: vehicles
+        4: pedestrians
+
     Args:
         obj_labels: shape (N, 11) - [x, y, z, lx, ly, lz, heading, label, state, vx, vy]
         config: 配置
-        
+
     Returns:
-        bev_semantic_map: shape (128, 256) - 语义分割图
+        bev_semantic_map: shape (H, W) - 语义分割图
     """
     if config is None:
         config = ADSGTConfig()
-    
+
     bev_semantic_map = np.zeros(config.bev_semantic_frame, dtype=np.uint8)
-    
+
     # 按类别分类物体 (先绘制静态物体，再绘制车辆，最后绘制行人)
-    # 根据 ADS FusionClassification:
-    # 1-6: 车辆类, 7-9: 行人/骑车人, 10-11: 无人车辆/自行车, 0: unknown
     static_objs = []
     vehicles = []
     pedestrians = []
-    
+
     for obj in obj_labels:
-        # 检查是否无效
         if _is_invalid_obj_label_row(obj):
             continue
-        
+
         x = obj[ADSObjectIndex.X]
         y = obj[ADSObjectIndex.Y]
-        
+        obj_class = int(obj[ADSObjectIndex.LABEL])
+
         # 检查是否在范围内
         if not (config.lidar_min_x <= x <= config.lidar_max_x and
                 config.lidar_min_y <= y <= config.lidar_max_y):
             continue
-        
-        obj_class = int(obj[ADSObjectIndex.LABEL])
-        
-        # 根据 ADS 类别映射
-        if obj_class in [1, 2, 3, 4, 5, 6]:  # 各类车辆
+
+        if obj_class in [1, 2, 3, 4, 5, 6]:
             vehicles.append(obj)
-        elif obj_class in [7, 8, 9]:  # 行人和骑车人
+        elif obj_class in [7, 8, 9]:
             pedestrians.append(obj)
-        else:  # 0 (unknown), 10-11 (无人车辆) -> static/other
+        else:  # 0, 10-11
             static_objs.append(obj)
-    
+
     # 按顺序绘制: static -> vehicle -> pedestrian
     for obj in static_objs:
         x, y, heading = obj[ADSObjectIndex.X], obj[ADSObjectIndex.Y], obj[ADSObjectIndex.HEADING]
         length, width = obj[ADSObjectIndex.LX], obj[ADSObjectIndex.LY]
-        _draw_box_on_bev(bev_semantic_map, x, y, heading, length, width, 
-                        BEVClassIndex.STATIC_OBJECTS, config)
-    
+        _draw_box_on_bev(bev_semantic_map, x, y, heading, length, width,
+                         BEVClassIndex.STATIC_OBJECTS, config)
+
     for obj in vehicles:
         x, y, heading = obj[ADSObjectIndex.X], obj[ADSObjectIndex.Y], obj[ADSObjectIndex.HEADING]
         length, width = obj[ADSObjectIndex.LX], obj[ADSObjectIndex.LY]
-        _draw_box_on_bev(bev_semantic_map, x, y, heading, length, width, 
-                        BEVClassIndex.VEHICLES, config)
-    
+        _draw_box_on_bev(bev_semantic_map, x, y, heading, length, width,
+                         BEVClassIndex.VEHICLES, config)
+
     for obj in pedestrians:
         x, y, heading = obj[ADSObjectIndex.X], obj[ADSObjectIndex.Y], obj[ADSObjectIndex.HEADING]
         length, width = obj[ADSObjectIndex.LX], obj[ADSObjectIndex.LY]
-        _draw_box_on_bev(bev_semantic_map, x, y, heading, length, width, 
-                        BEVClassIndex.PEDESTRIANS, config)
-    
+        _draw_box_on_bev(bev_semantic_map, x, y, heading, length, width,
+                         BEVClassIndex.PEDESTRIANS, config)
+
     return bev_semantic_map
 
 
@@ -564,24 +598,24 @@ def process_ads_frame(
 ) -> dict:
     """
     处理单帧 ADS 数据，生成 agent targets 和 BEV 语义图
-    
+
     Args:
         obj_labels: shape (N, 11) - 动态物体标签
         config: 配置
-        static_obj_feat: 静态物体特征 (可选)
+        static_obj_feat: 静态物体特征 (可选，包含车道线)
         static_obj_mask: 静态物体mask (可选)
         curb_feat: 路缘特征 (可选)
         curb_mask: 路缘mask (可选)
-        
+
     Returns:
         dict: 包含 agent_states, agent_labels, bev_semantic_map
     """
     if config is None:
         config = ADSGTConfig()
-    
+
     # Agent targets
     agent_states, agent_labels = compute_agent_targets_ads(obj_labels, config)
-    
+
     # BEV semantic map
     if static_obj_feat is not None:
         bev_semantic_map = compute_bev_semantic_map_ads(
@@ -591,11 +625,11 @@ def process_ads_frame(
         )
     else:
         bev_semantic_map = compute_bev_semantic_map_ads_simple(obj_labels, config)
-    
+
     return {
         'agent_states': agent_states,       # shape (num_bounding_boxes, 5)
         'agent_labels': agent_labels,       # shape (num_bounding_boxes,) int64
-        'bev_semantic_map': bev_semantic_map,  # shape (128, 256)
+        'bev_semantic_map': bev_semantic_map,  # shape (H, W)
     }
 
 
@@ -603,10 +637,11 @@ def process_ads_frame(
 
 # BEV 类别对应的颜色 (BGR 格式)
 BEV_CLASS_COLORS = {
-    BEVClassIndex.BACKGROUND: (40, 40, 40),       # 深灰色背景
-    BEVClassIndex.STATIC_OBJECTS: (128, 128, 128), # 灰色 - 静态物体/车道线
-    BEVClassIndex.VEHICLES: (0, 165, 255),         # 橙色 - 车辆
-    BEVClassIndex.PEDESTRIANS: (0, 255, 0),        # 绿色 - 行人
+    BEVClassIndex.BACKGROUND: (30, 30, 30),        # 深灰背景
+    BEVClassIndex.LANE_LINES: (255, 255, 255),     # 白色 - 车道线
+    BEVClassIndex.STATIC_OBJECTS: (100, 100, 100), # 灰色 - 静态物体
+    BEVClassIndex.VEHICLES: (0, 165, 255),          # 橙色 - 车辆
+    BEVClassIndex.PEDESTRIANS: (0, 255, 0),         # 绿色 - 行人
 }
 
 # Agent 类别对应的颜色 (BGR 格式)
@@ -625,74 +660,134 @@ def visualize_bev_semantic_map(
     config: Optional[ADSGTConfig] = None,
     save_path: Optional[str] = None,
     title: str = "BEV Semantic Map",
+    high_res: bool = True,
+    show_grid: bool = True,
+    show_legend: bool = True,
+    show_distance: bool = True,
+    show_range_text: bool = True,
 ) -> npt.NDArray[np.uint8]:
     """
-    可视化 BEV Semantic Map
+    可视化 BEV Semantic Map (ego在中心，支持高分辨率)
     
+    注意：
+    - 训练数据使用 compute_bev_semantic_map_ads() 生成纯语义图，不包含任何装饰
+    - 此函数仅用于可视化，可选择性显示网格、图例等元素
+    - 只显示填充的语义图，不额外绘制bbox线框
+
     Args:
-        bev_map: shape (H, W) - 语义分割图，值为 0-3
-        agent_states: shape (N, 5) - [x, y, heading, length, width] (可选)
-        agent_labels: shape (N,) - agent 类别标签 (可选)
+        bev_map: shape (H, W) - 语义分割图（训练数据，无装饰）
+        agent_states: shape (N, 5) - 保留用于兼容，但不绘制
+        agent_labels: shape (N,) - 保留用于兼容，但不绘制
         config: ADSGTConfig (可选)
         save_path: 保存路径 (可选)
         title: 图像标题
-        
+        high_res: 是否使用高分辨率 (默认True)
+        show_grid: 是否显示网格线 (默认True)
+        show_legend: 是否显示图例 (默认True)
+        show_distance: 是否显示距离标注 (默认True)
+        show_range_text: 是否显示范围文本 (默认True)
+
     Returns:
         vis_image: shape (H, W, 3) - BGR 可视化图像
     """
     if config is None:
         config = ADSGTConfig()
-    
-    H, W = bev_map.shape
-    
+
+    H_orig, W_orig = bev_map.shape
+    scale = config.vis_scale if high_res else 1
+
+    # 放大 bev_map 用于可视化
+    if scale > 1:
+        vis_bev = cv2.resize(bev_map, (W_orig * scale, H_orig * scale),
+                             interpolation=cv2.INTER_NEAREST)
+    else:
+        vis_bev = bev_map.copy()
+
+    H, W = vis_bev.shape
+
     # 创建彩色可视化图
     vis_image = np.zeros((H, W, 3), dtype=np.uint8)
-    
+
     # 根据类别填充颜色
     for cls_idx, color in BEV_CLASS_COLORS.items():
-        mask = (bev_map == cls_idx)
+        mask = (vis_bev == cls_idx)
         vis_image[mask] = color
-    
-    # 绘制网格线 (每 10m 一条)
-    pixels_per_10m = int(10.0 / config.bev_pixel_size)
-    
-    # 垂直线 (Y 方向)
-    center_x = W // 2
-    for i in range(-5, 6):
-        x = center_x + i * pixels_per_10m
-        if 0 <= x < W:
-            cv2.line(vis_image, (x, 0), (x, H-1), (60, 60, 60), 1)
-    
-    # 水平线 (X 方向) - 从底部往上
-    for i in range(0, 10):
-        y = H - 1 - i * pixels_per_10m
-        if 0 <= y < H:
-            cv2.line(vis_image, (0, y), (W-1, y), (60, 60, 60), 1)
-    
-    # 绘制自车位置 (底部中心)
-    ego_x = W // 2
-    ego_y = H - 1
-    cv2.circle(vis_image, (ego_x, ego_y), 5, (0, 0, 255), -1)  # 红色圆点
-    cv2.arrowedLine(vis_image, (ego_x, ego_y), (ego_x, ego_y - 20), (0, 0, 255), 2)  # 红色箭头
-    
-    # 添加图例
-    legend_y = 20
-    for cls_idx, color in BEV_CLASS_COLORS.items():
-        label_names = {0: "Background", 1: "Static/Lane", 2: "Vehicle", 3: "Pedestrian"}
-        cv2.rectangle(vis_image, (10, legend_y - 12), (25, legend_y + 3), color, -1)
-        cv2.putText(vis_image, label_names[cls_idx], (30, legend_y), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-        legend_y += 18
-    
+
+    # 计算 ego 中心位置 (图像中心)
+    ego_col = W // 2
+    ego_row = H // 2
+    pixel_size_vis = config.bev_pixel_size / scale
+    pixels_per_10m = int(10.0 / pixel_size_vis)
+
+    # 绘制网格线 (每 10m 一条) - 可选
+    if show_grid:
+        # 垂直线 (Y 方向，左右)
+        for i in range(-10, 11):
+            col = ego_col + i * pixels_per_10m
+            if 0 <= col < W:
+                cv2.line(vis_image, (col, 0), (col, H-1), (50, 50, 50), 1)
+
+        # 水平线 (X 方向，前后)
+        for i in range(-10, 11):
+            row = ego_row + i * pixels_per_10m
+            if 0 <= row < H:
+                cv2.line(vis_image, (0, row), (W-1, row), (50, 50, 50), 1)
+
+    # 绘制自车 (ego) - 在中心，填充矩形
+    ego_length_px = int(4.5 / pixel_size_vis)  # 假设车长4.5m
+    ego_width_px = int(2.0 / pixel_size_vis)   # 假设车宽2.0m
+    ego_pts = np.array([
+        [ego_col - ego_width_px // 2, ego_row - ego_length_px // 2],  # 前左
+        [ego_col + ego_width_px // 2, ego_row - ego_length_px // 2],  # 前右
+        [ego_col + ego_width_px // 2, ego_row + ego_length_px // 2],  # 后右
+        [ego_col - ego_width_px // 2, ego_row + ego_length_px // 2],  # 后左
+    ], dtype=np.int32).reshape((-1, 1, 2))
+    cv2.fillPoly(vis_image, [ego_pts], color=(0, 0, 255))
+    cv2.polylines(vis_image, [ego_pts], isClosed=True, color=(255, 255, 255), thickness=2)
+    cv2.circle(vis_image, (ego_col, ego_row), 5, (255, 255, 255), -1)
+
+    # 添加图例 - 可选
+    if show_legend:
+        legend_x = 15
+        legend_y = 30
+        label_names = {
+            BEVClassIndex.BACKGROUND: "Background",
+            BEVClassIndex.LANE_LINES: "Lane Lines",
+            BEVClassIndex.STATIC_OBJECTS: "Static Obj",
+            BEVClassIndex.VEHICLES: "Vehicle",
+            BEVClassIndex.PEDESTRIANS: "Pedestrian",
+        }
+        for cls_idx, color in BEV_CLASS_COLORS.items():
+            cv2.rectangle(vis_image, (legend_x, legend_y - 15), (legend_x + 20, legend_y + 5), color, -1)
+            cv2.putText(vis_image, label_names.get(cls_idx, "Unknown"), (legend_x + 28, legend_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            legend_y += 25
+
+    # 添加距离标注 - 可选
+    if show_distance:
+        for dist in [10, 20, 30]:
+            if dist <= abs(config.lidar_max_x):
+                dist_px = int(dist / pixel_size_vis)
+                # 前方标注
+                cv2.putText(vis_image, f"{dist}m", (ego_col + 5, ego_row - dist_px),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+
     # 添加标题
-    cv2.putText(vis_image, title, (W // 2 - 60, 15), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-    
+    if title:
+        cv2.putText(vis_image, title, (W // 2 - 100, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+    # 添加范围信息 - 可选
+    if show_range_text:
+        range_text = f"Range: [{config.lidar_min_x:.0f}, {config.lidar_max_x:.0f}]m x [{config.lidar_min_y:.0f}, {config.lidar_max_y:.0f}]m"
+        cv2.putText(vis_image, range_text, (10, H - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+
     # 保存
     if save_path is not None:
         cv2.imwrite(save_path, vis_image)
         print(f"BEV visualization saved to: {save_path}")
-    
+
     return vis_image
 
 
@@ -766,7 +861,10 @@ def visualize_bev_debug(
     print(f"BEV map shape: {bev_map.shape}")
     
     unique, counts = np.unique(bev_map, return_counts=True)
-    label_names = {0: "background", 1: "static", 2: "vehicle", 3: "pedestrian"}
+    label_names = {
+        0: "background", 1: "lane_lines", 2: "static", 
+        3: "vehicle", 4: "pedestrian"
+    }
     print("BEV Label Distribution:")
     for label, count in zip(unique, counts):
         name = label_names.get(int(label), f"label_{label}")
@@ -784,46 +882,76 @@ def visualize_bev_debug(
 
 
 if __name__ == "__main__":
-    """测试代码"""
+    """
+    测试代码
+    
+    注意事项：
+    1. 训练数据 (bev_semantic_map) 是纯粹的语义图 (uint8)，无任何装饰元素
+    2. 可视化函数用于人眼查看，可选择性添加网格、图例等元素
+    3. 坐标轴已移除，保持图像简洁
+    """
     # 创建模拟数据
     obj_labels = np.array([
         # [x, y, z, lx, ly, lz, heading, label, state, vx, vy]
         [10.0, 2.0, 0.0, 4.5, 2.0, 1.5, 0.1, 2, 0, 5.0, 0.0],   # vehicle (CAR)
         [15.0, -3.0, 0.0, 4.0, 1.8, 1.5, -0.2, 2, 0, 3.0, 0.0],  # vehicle (CAR)
         [8.0, 5.0, 0.0, 0.5, 0.5, 1.7, 0.0, 7, 0, 1.0, 0.5],    # pedestrian
+        [-10.0, -5.0, 0.0, 4.0, 2.0, 1.5, 0.5, 2, 0, 3.0, -1.0], # vehicle (后方)
         [-1000, -1000, -1000, 0, 0, 0, 0, 0, 0, 0, 0],          # invalid (padding)
     ])
     
     config = ADSGTConfig()
     
     print("=" * 60)
-    print("ADS GT Utils 测试")
+    print("ADS GT Utils 测试 (Ego在中心)")
     print("=" * 60)
     
     # 测试 agent targets
     agent_states, agent_labels = compute_agent_targets_ads(obj_labels, config)
     print(f"\nAgent States shape: {agent_states.shape}")
     print(f"Agent Labels shape: {agent_labels.shape}")
-    print(f"Agent Labels: {agent_labels[:5]}")
+    print(f"Non-empty agents: {(agent_labels != 0).sum()}")
     
     # 测试 BEV semantic map
     bev_map = compute_bev_semantic_map_ads_simple(obj_labels, config)
     print(f"\nBEV Map shape: {bev_map.shape}")
     
     unique, counts = np.unique(bev_map, return_counts=True)
-    label_names = {0: "background", 1: "static", 2: "vehicle", 3: "pedestrian"}
+    label_names = {
+        0: "background", 1: "lane_lines", 2: "static", 
+        3: "vehicle", 4: "pedestrian"
+    }
     print("BEV Label Distribution:")
     for label, count in zip(unique, counts):
         name = label_names.get(int(label), f"label_{label}")
         total = bev_map.size
         print(f"  {int(label)} ({name}): {count} ({100*count/total:.2f}%)")
     
-    # 保存可视化
-    vis_image = visualize_bev_semantic_map(bev_map, agent_states, agent_labels, config)
+    # 保存可视化 (高分辨率，带完整装饰)
+    vis_image = visualize_bev_semantic_map(
+        bev_map, agent_states, agent_labels, config, 
+        high_res=True,
+        show_grid=True,      # 显示网格
+        show_legend=True,    # 显示图例
+        show_distance=True,  # 显示距离标注
+        show_range_text=True # 显示范围文本
+    )
     cv2.imwrite('/tmp/bev_semantic_map_ads_test.png', vis_image)
     print("\nVisualization saved to /tmp/bev_semantic_map_ads_test.png")
+    
+    # 保存无装饰版本（仅用于对比）
+    vis_image_clean = visualize_bev_semantic_map(
+        bev_map, agent_states, agent_labels, config,
+        high_res=True,
+        show_grid=False,      # 不显示网格
+        show_legend=False,    # 不显示图例
+        show_distance=False,  # 不显示距离
+        show_range_text=False,# 不显示范围
+        title=""              # 不显示标题
+    )
+    cv2.imwrite('/tmp/bev_semantic_map_ads_clean.png', vis_image_clean)
+    print("Clean visualization saved to /tmp/bev_semantic_map_ads_clean.png")
     
     print("\n" + "=" * 60)
     print("测试完成！")
     print("=" * 60)
-
