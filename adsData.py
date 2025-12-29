@@ -835,7 +835,7 @@ class LazySupervisedHuawei2VAROSSDataset(ADSData):
         # 4. 生成 Agent targets
         agent_states, agent_labels = compute_agent_targets_ads(obj_label, self.gt_config)
         
-        # 5. 可视化并保存
+        # 5. 可视化并保存（高分辨率 + 完整装饰）
         save_path = os.path.join(self.debug_save_dir, f"bev_{sample_id}.png")
         visualize_bev_semantic_map(
             bev_map=bev_map,
@@ -844,6 +844,11 @@ class LazySupervisedHuawei2VAROSSDataset(ADSData):
             config=self.gt_config,
             save_path=save_path,
             title=f"Sample: {sample_id}",
+            high_res=True,          # 高分辨率 1024x1024
+            show_grid=True,         # 显示网格
+            show_legend=True,       # 显示图例
+            show_distance=True,     # 显示距离标注
+            show_range_text=True,   # 显示范围信息
         )
         
         self.debug_bev_count += 1
@@ -1140,10 +1145,17 @@ class LazySupervisedHuawei2VAROSSDataset_Multiview4(ADSData):
         if self.debug_bev:
             from huawei_code.transfuser_gt_utils_ads import ADSGTConfig
             self.gt_config = ADSGTConfig(
-                vis_scale=8
+                bev_pixel_width=256,
+                bev_pixel_height=256,     # ✅ 正方形，前后对称
+                lidar_min_x=-32.0,        # ✅ Ego在中心，可看后方
+                lidar_max_x=32.0,
+                lidar_min_y=-32.0,
+                lidar_max_y=32.0,
+                use_fov_filter=False,
+                vis_scale=8,              # 更高的可视化分辨率
             )
             os.makedirs(self.debug_save_dir, exist_ok=True)
-            rank0_print(f"[BEV Debug] Enabled, saving to {self.debug_save_dir}")
+            rank0_print(f"[BEV Debug] Enabled (Ego-Centric), saving to {self.debug_save_dir}")
 
     def __len__(self):
         return len(self.data)
@@ -1279,7 +1291,7 @@ class LazySupervisedHuawei2VAROSSDataset_Multiview4(ADSData):
         # 4. 生成 Agent targets
         agent_states, agent_labels = compute_agent_targets_ads(obj_label, self.gt_config)
 
-        # 5. 可视化并保存
+        # 5. 可视化并保存（高分辨率 + 完整装饰）
         save_path = os.path.join(self.debug_save_dir, f"bev_{sample_id}.png")
         visualize_bev_semantic_map(
             bev_map=bev_map,
@@ -1288,6 +1300,11 @@ class LazySupervisedHuawei2VAROSSDataset_Multiview4(ADSData):
             config=self.gt_config,
             save_path=save_path,
             title=f"Sample: {sample_id}",
+            high_res=True,          # 高分辨率 1024x1024
+            show_grid=True,         # 显示网格
+            show_legend=True,       # 显示图例
+            show_distance=True,     # 显示距离标注
+            show_range_text=True,   # 显示范围信息
         )
 
         self.debug_bev_count += 1
@@ -1653,7 +1670,7 @@ class LazySupervisedHuawei2VAROSSMOEDataset_Multiview4(ADSData):
 
         rank0_print("Huawei2VA: frames_per_second=%d, action_hz=%d, gap_frames=%d" % (self.frames_per_second, self.action_hz, self.gap_frames))
 
-        # ========== BEV 可视化配置 (最简实现) ==========
+        # ========== BEV 可视化配置 ==========
         self.debug_bev = getattr(data_args, "debug_bev", False)
         self.debug_save_dir = getattr(data_args, "debug_save_dir", "/tmp/bev_debug")
         self.debug_bev_count = 0  # 控制可视化数量
@@ -1663,15 +1680,15 @@ class LazySupervisedHuawei2VAROSSMOEDataset_Multiview4(ADSData):
             from huawei_code.transfuser_gt_utils_ads import ADSGTConfig
             self.gt_config = ADSGTConfig(
                 bev_pixel_width=256,
-                bev_pixel_height=128,
-                lidar_min_x=0.0,
+                bev_pixel_height=256,     # ✅ 正方形，前后对称
+                lidar_min_x=-32.0,        # ✅ Ego在中心，可看后方
                 lidar_max_x=32.0,
                 lidar_min_y=-32.0,
                 lidar_max_y=32.0,
-                use_fov_filter=False,  # 多视角不需要FOV过滤
+                use_fov_filter=False,     # 多视角不需要FOV过滤
             )
             os.makedirs(self.debug_save_dir, exist_ok=True)
-            rank0_print(f"[BEV Debug] Enabled, saving to {self.debug_save_dir}")
+            rank0_print(f"[BEV Debug] Enabled (Ego-Centric), saving to {self.debug_save_dir}")
 
     def __len__(self):
         return len(self.data)
@@ -1807,7 +1824,7 @@ class LazySupervisedHuawei2VAROSSMOEDataset_Multiview4(ADSData):
         # 4. 生成 Agent targets
         agent_states, agent_labels = compute_agent_targets_ads(obj_label, self.gt_config)
 
-        # 5. 可视化并保存
+        # 5. 可视化并保存（高分辨率 + 完整装饰）
         save_path = os.path.join(self.debug_save_dir, f"bev_{sample_id}.png")
         visualize_bev_semantic_map(
             bev_map=bev_map,
@@ -1816,6 +1833,11 @@ class LazySupervisedHuawei2VAROSSMOEDataset_Multiview4(ADSData):
             config=self.gt_config,
             save_path=save_path,
             title=f"Sample: {sample_id}",
+            high_res=True,          # 高分辨率 1024x1024
+            show_grid=True,         # 显示网格
+            show_legend=True,       # 显示图例
+            show_distance=True,     # 显示距离标注
+            show_range_text=True,   # 显示范围信息
         )
 
         self.debug_bev_count += 1
