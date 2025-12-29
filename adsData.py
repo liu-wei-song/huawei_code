@@ -1686,6 +1686,7 @@ class LazySupervisedHuawei2VAROSSMOEDataset_Multiview4(ADSData):
                 lidar_min_y=-32.0,
                 lidar_max_y=32.0,
                 use_fov_filter=False,     # 多视角不需要FOV过滤
+                vis_scale=8,
             )
             os.makedirs(self.debug_save_dir, exist_ok=True)
             rank0_print(f"[BEV Debug] Enabled (Ego-Centric), saving to {self.debug_save_dir}")
