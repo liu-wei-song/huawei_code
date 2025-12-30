@@ -47,7 +47,10 @@ from reference.transformers.src.transformers.models.qwen2_5_vl.modeling_qwen2_5_
     Qwen2_5_VLForConditionalGenerationROSS,
     Qwen2_5_VLForConditionalGenerationROSS_MOE,
     Qwen2_5_VLConfigROSSMOE_ACTIONEXPERT,
-    Qwen2_5_VLConfigROSSMOE
+    Qwen2_5_VLConfigROSSMOE,
+    # BEV
+    Qwen2_5_VLConfigROSSMOE_BEV,
+    Qwen2_5_VLForConditionalGenerationROSS_MOE_BEV,
 )
 
 import transformers.trainer as _trainer
@@ -68,7 +71,10 @@ from qwenvl.dataset.data_qwen_vla import (
 
 from adsdata.adsData import (
     make_supervised_data_module_huawei2_vla_ross_multiview4_5kw,
-    make_supervised_data_module_huawei2_vla_ross_moe_multiview4_5kw
+    make_supervised_data_module_huawei2_vla_ross_moe_multiview4_5kw,
+    # BEV
+    make_supervised_data_module_huawei2_vla_ross_moe_bev_5kw,
+    setup_bev_tokens,
 )
 
 from qwenvl.train.argument import (
@@ -112,6 +118,7 @@ def setup_vla_model_and_tokenizer(model_args, training_args):
         "qwen2.5vl": Qwen2_5_VLForConditionalGeneration,
         "qwen2.5vl_ross": Qwen2_5_VLForConditionalGenerationROSS,
         "qwen2.5vl_ross_moe": Qwen2_5_VLForConditionalGenerationROSS_MOE,
+        "qwen2.5vl_ross_moe_bev": Qwen2_5_VLForConditionalGenerationROSS_MOE_BEV,
     }
     if model_type not in ARCH_BY_MODEL_TYPE:
         raise ValueError(f"Unsupported model_type: {model_type}")
@@ -122,7 +129,32 @@ def setup_vla_model_and_tokenizer(model_args, training_args):
     tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path)
 
     # Build config: base -> (optional) ROSS wrapper
-    if model_type == "qwen2.5vl_ross_moe":
+    if model_type == "qwen2.5vl_ross_moe_bev":
+        # BEV-enabled MOE model
+        base_cfg = Qwen2_5_VLConfig.from_pretrained(
+            qwen_addr, trust_remote_code=True
+        )
+        action_cfg = Qwen2_5_VLConfigROSSMOE_ACTIONEXPERT(
+            **base_cfg.to_dict()
+        )
+        # BEV config extends MOE config
+        bev_cfg = Qwen2_5_VLConfigROSSMOE_BEV(
+            **base_cfg.to_dict(),
+            training_args=training_args,
+            num_map_queries=getattr(training_args, "num_map_queries", 64),
+            num_bev_classes=getattr(training_args, "num_bev_classes", 5),
+            bev_output_size=getattr(training_args, "bev_output_size", (256, 256)),
+            bev_loss_weight=getattr(training_args, "bev_loss_weight", 10.0),
+            enable_bev_loss=getattr(training_args, "enable_bev_loss", True),
+        )
+        model = Qwen2_5_VLForConditionalGenerationROSS_MOE_BEV(
+            config=bev_cfg,               
+            action_config=action_cfg, 
+            ckpt_path=model_args.model_name_or_path,
+            data_type=torch.bfloat16
+        ).cuda()
+        
+    elif model_type == "qwen2.5vl_ross_moe":
         base_cfg = Qwen2_5_VLConfig.from_pretrained(
             qwen_addr, trust_remote_code=True
         )
@@ -378,6 +410,13 @@ def train():
         data_module = make_supervised_data_module_huawei2_vla_ross_multiview4_5kw(tokenizer=tokenizer, data_args=data_args)
     elif data_args.dataset_type == "huawei2va_ross_moe_5kw":
         data_module = make_supervised_data_module_huawei2_vla_ross_moe_multiview4_5kw(tokenizer=tokenizer, data_args=data_args)
+    elif data_args.dataset_type == "huawei2va_ross_moe_bev_5kw":
+        # Setup <map> token before creating dataset
+        token_info = setup_bev_tokens(tokenizer)
+        # Update model with map_token_id if BEV model
+        if hasattr(model, 'map_token_id'):
+            model.map_token_id = token_info["map_token_id"]
+        data_module = make_supervised_data_module_huawei2_vla_ross_moe_bev_5kw(tokenizer=tokenizer, data_args=data_args)
     else:
         raise ValueError(f"Unsupport dataset_type {data_args.dataset_type}")
     rank0_print("Using standard VLA data format")

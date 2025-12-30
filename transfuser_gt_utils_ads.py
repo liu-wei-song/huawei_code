@@ -139,7 +139,7 @@ class ADSGTConfig:
     num_bev_classes: int = 5  # background + lane + static + vehicle + pedestrian
 
     # 车道线绘制参数
-    lane_line_thickness: int = 2  # 训练用的线宽
+    lane_line_thickness: int = 1  # 训练用的线宽（细线）
     static_line_thickness: int = 2  # 静态物体线宽
 
     @property
@@ -396,38 +396,55 @@ def _draw_polylines(
 
     Args:
         bev_map: BEV语义图
-        feat: shape (N, P, 2) - N条线，每条有P个点 [x, y]
-        mask: shape (N, ...) - 有效性mask
+        feat: shape (N, P, 2) 或 (N, P, 3) - N条线，每条有P个点
+              如果是3维，只取前两维 [x, y]
+        mask: shape (N, P) 或 (N,) - 有效性mask
+              - (N, P): 每个点的mask，判断每条线是否有足够有效点
+              - (N,): 每条线的mask
         label: 类别标签
         config: 配置
         thickness: 线宽
         scale: 分辨率放大倍数
         closed: 是否闭合
     """
-    # 处理 mask
-    if mask.ndim >= 2:
-        valid = mask[..., -1].astype(bool)
+    # ✅ 适配 (N, P, 3) 格式，只取前两维
+    if feat.ndim == 3 and feat.shape[-1] == 3:
+        feat = feat[..., :2]  # (N, P, 2)
+    
+    # ✅ 处理 mask - 判断每条线是否有效
+    if mask.ndim == 2:  # mask shape: (N, P)
+        # 对每条线，检查是否有足够的有效点
+        line_valid = mask.sum(axis=-1) >= 2  # 至少2个有效点
+    elif mask.ndim == 1:  # mask shape: (N,)
+        line_valid = mask.astype(bool)
     else:
-        valid = mask.astype(bool)
+        line_valid = np.ones(feat.shape[0], dtype=bool)
 
     for i in range(feat.shape[0]):
-        if i >= len(valid) or not valid[i]:
+        if not line_valid[i]:
             continue
 
         points = feat[i]  # (P, 2)
-
-        # 过滤无效点 (距离太小的点视为padding)
+        
+        # ✅ 如果有点级mask，使用它来过滤点
+        if mask.ndim == 2:
+            point_mask = mask[i].astype(bool)  # (P,)
+            points = points[point_mask]  # 只保留有效点
+        
+        # 过滤距离太小的点（padding）
         valid_mask = np.linalg.norm(points, axis=-1) > 0.01
         valid_points = points[valid_mask]
+        
         if len(valid_points) < 2:
             continue
 
         # 转换为像素坐标
         pixel_coords = _world_to_pixel_array(valid_points, config, scale)
 
-        # 绘制线条
+        # 绘制线条（添加抗锯齿效果）
         cv2.polylines(bev_map, [pixel_coords], isClosed=closed,
-                      color=int(label), thickness=max(1, thickness * scale))
+                      color=int(label), thickness=max(1, thickness * scale),
+                      lineType=cv2.LINE_AA)  # ✨ 抗锯齿
 
 
 def compute_bev_semantic_map_ads(
@@ -453,10 +470,13 @@ def compute_bev_semantic_map_ads(
         obj_labels: shape (N, 11) - 动态物体
         config: 配置
         valid_mask: shape (N,) - 有效物体的 mask (可选)
-        static_obj_feat: shape (M, P, 2) - 静态物体轮廓点 (包含车道线)
-        static_obj_mask: shape (M, ...) - 静态物体 mask
-        curb_feat: shape (K, P, 2) - 路缘点
-        curb_mask: shape (K, ...) - 路缘 mask
+        static_obj_feat: shape (M, P, 2) 或 (M, P, 3) - 静态物体轮廓点（包含车道线）
+                        如果是3维，只使用前两维 [x, y]
+        static_obj_mask: shape (M, P) 或 (M,) - 静态物体 mask
+                        (M, P): 每个点的mask
+                        (M,): 每条线的mask
+        curb_feat: shape (K, P, 2) 或 (K, P, 3) - 路缘点
+        curb_mask: shape (K, P) 或 (K,) - 路缘 mask
 
     Returns:
         bev_semantic_map: shape (H, W) - 语义分割图
@@ -635,13 +655,13 @@ def process_ads_frame(
 
 # ============ 可视化工具 ============
 
-# BEV 类别对应的颜色 (BGR 格式)
+# BEV 类别对应的颜色 (BGR 格式) - 优化配色方案
 BEV_CLASS_COLORS = {
-    BEVClassIndex.BACKGROUND: (30, 30, 30),        # 深灰背景
-    BEVClassIndex.LANE_LINES: (255, 255, 255),     # 白色 - 车道线
-    BEVClassIndex.STATIC_OBJECTS: (100, 100, 100), # 灰色 - 静态物体
-    BEVClassIndex.VEHICLES: (0, 165, 255),          # 橙色 - 车辆
-    BEVClassIndex.PEDESTRIANS: (0, 255, 0),         # 绿色 - 行人
+    BEVClassIndex.BACKGROUND: (40, 40, 40),         # 深灰背景（稍微亮一点）
+    BEVClassIndex.LANE_LINES: (150, 150, 150),      # 灰色 - 车道线（低调一些）
+    BEVClassIndex.STATIC_OBJECTS: (120, 120, 120),  # 灰色 - 静态物体
+    BEVClassIndex.VEHICLES: (0, 140, 255),          # 橙红色 - 车辆（更鲜艳）
+    BEVClassIndex.PEDESTRIANS: (100, 255, 100),     # 亮绿色 - 行人（更明亮）
 }
 
 # Agent 类别对应的颜色 (BGR 格式)
@@ -719,21 +739,26 @@ def visualize_bev_semantic_map(
     pixel_size_vis = config.bev_pixel_size / scale
     pixels_per_10m = int(10.0 / pixel_size_vis)
 
-    # 绘制网格线 (每 10m 一条) - 可选
+    # 绘制网格线 (每 10m 一条) - 可选，使用更淡的颜色
     if show_grid:
+        grid_color = (60, 60, 60)  # 稍微亮一点的灰色
         # 垂直线 (Y 方向，左右)
         for i in range(-10, 11):
             col = ego_col + i * pixels_per_10m
             if 0 <= col < W:
-                cv2.line(vis_image, (col, 0), (col, H-1), (50, 50, 50), 1)
+                # 中心线加粗
+                thickness = 2 if i == 0 else 1
+                cv2.line(vis_image, (col, 0), (col, H-1), grid_color, thickness, cv2.LINE_AA)
 
         # 水平线 (X 方向，前后)
         for i in range(-10, 11):
             row = ego_row + i * pixels_per_10m
             if 0 <= row < H:
-                cv2.line(vis_image, (0, row), (W-1, row), (50, 50, 50), 1)
+                # 中心线加粗
+                thickness = 2 if i == 0 else 1
+                cv2.line(vis_image, (0, row), (W-1, row), grid_color, thickness, cv2.LINE_AA)
 
-    # 绘制自车 (ego) - 在中心，填充矩形
+    # 绘制自车 (ego) - 在中心，更醒目的样式
     ego_length_px = int(4.5 / pixel_size_vis)  # 假设车长4.5m
     ego_width_px = int(2.0 / pixel_size_vis)   # 假设车宽2.0m
     ego_pts = np.array([
@@ -742,9 +767,16 @@ def visualize_bev_semantic_map(
         [ego_col + ego_width_px // 2, ego_row + ego_length_px // 2],  # 后右
         [ego_col - ego_width_px // 2, ego_row + ego_length_px // 2],  # 后左
     ], dtype=np.int32).reshape((-1, 1, 2))
-    cv2.fillPoly(vis_image, [ego_pts], color=(0, 0, 255))
-    cv2.polylines(vis_image, [ego_pts], isClosed=True, color=(255, 255, 255), thickness=2)
-    cv2.circle(vis_image, (ego_col, ego_row), 5, (255, 255, 255), -1)
+    
+    # 填充 + 边框（颜色更鲜艳）
+    cv2.fillPoly(vis_image, [ego_pts], color=(50, 50, 255))  # 亮红色
+    cv2.polylines(vis_image, [ego_pts], isClosed=True, color=(255, 255, 255), thickness=3, lineType=cv2.LINE_AA)
+    
+    # 添加方向指示（前方箭头）
+    arrow_start = (ego_col, ego_row)
+    arrow_end = (ego_col, ego_row - ego_length_px // 2 - 10)
+    cv2.arrowedLine(vis_image, arrow_start, arrow_end, (255, 255, 255), 3, tipLength=0.3, line_type=cv2.LINE_AA)
+    cv2.circle(vis_image, (ego_col, ego_row), 6, (255, 255, 255), -1)
 
     # 添加图例 - 可选
     if show_legend:

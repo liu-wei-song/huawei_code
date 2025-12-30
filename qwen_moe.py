@@ -1531,6 +1531,344 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
     
+# ============ BEV Semantic Head ============
+
+class BEVSemanticHead(nn.Module):
+    """BEV semantic segmentation head."""
+    
+    def __init__(
+        self, 
+        d_model: int, 
+        num_map_queries: int = 64,
+        num_classes: int = 5,
+        output_size: Tuple[int, int] = (256, 256),
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.num_map_queries = num_map_queries
+        self.num_classes = num_classes
+        self.output_size = output_size
+        
+        # Calculate intermediate feature size
+        # num_map_queries should be h*w where h and w are intermediate sizes
+        self.feat_h = 8
+        self.feat_w = 8
+        assert num_map_queries == self.feat_h * self.feat_w, \
+            f"num_map_queries ({num_map_queries}) must equal feat_h*feat_w ({self.feat_h*self.feat_w})"
+        
+        # Project to feature channels
+        self.proj = nn.Linear(d_model, 256)
+        
+        # Upsample and predict
+        self.decoder = nn.Sequential(
+            nn.Conv2d(256, 128, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),  # 8->16
+            nn.Conv2d(128, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),  # 16->32
+            nn.Conv2d(64, 32, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),  # 32->64
+            nn.Conv2d(32, 32, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),  # 64->128
+            nn.Conv2d(32, num_classes, kernel_size=1),
+            nn.Upsample(size=output_size, mode='bilinear', align_corners=False),  # 128->256
+        )
+    
+    def forward(self, map_queries: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            map_queries: [B, num_map_queries, d_model]
+        Returns:
+            bev_semantic_map: [B, num_classes, H, W]
+        """
+        B = map_queries.shape[0]
+        
+        # Project and reshape to 2D
+        x = self.proj(map_queries)  # [B, num_map_queries, 256]
+        x = x.view(B, self.feat_h, self.feat_w, -1)  # [B, h, w, 256]
+        x = x.permute(0, 3, 1, 2)  # [B, 256, h, w]
+        
+        # Decode to full resolution
+        bev_map = self.decoder(x)  # [B, num_classes, H, W]
+        
+        return bev_map
+
+
+# ============ BEV Config ============
+
+class Qwen2_5_VLConfigROSSMOE_BEV(PretrainedConfig):
+    """Extended config with ROSS + BEV support."""
+    
+    def __init__(
+        self,
+        training_args=None,
+        # BEV specific
+        num_map_queries: int = 64,
+        num_bev_classes: int = 5,
+        bev_output_size: Tuple[int, int] = (256, 256),
+        bev_loss_weight: float = 10.0,
+        enable_bev_loss: bool = True,
+        map_token_id: Optional[int] = None,
+        **kwargs
+    ):
+        super().__init__(**kwargs)
+        if training_args is not None:
+            self.action_loss_weight = getattr(training_args, "action_loss_weight", 1.0)
+            self.vlm_action_loss_weight = getattr(training_args, "vlm_action_loss_weight", 0.0)
+            self.vlm_ross_loss_weight = getattr(training_args, "vlm_ross_loss_weight", 0.0)
+        else:
+            self.action_loss_weight = 1.0
+            self.vlm_action_loss_weight = 0.0
+            self.vlm_ross_loss_weight = 0.0
+        
+        # BEV config
+        self.num_map_queries = num_map_queries
+        self.num_bev_classes = num_bev_classes
+        self.bev_output_size = bev_output_size
+        self.bev_loss_weight = bev_loss_weight
+        self.enable_bev_loss = enable_bev_loss
+        self.map_token_id = map_token_id
+
+
+# ============ BEV Model ============
+
+class Qwen2_5_VLForConditionalGenerationROSS_MOE_BEV(Qwen2_5_VLForConditionalGenerationROSS_MOE):
+    """
+    MOE model with BEV semantic map prediction support.
+    Extends Qwen2_5_VLForConditionalGenerationROSS_MOE with:
+    - <map> token embedding replacement
+    - BEV semantic head
+    - BEV loss computation
+    """
+    
+    def __init__(self, config, action_config, ckpt_path=None, data_type=torch.float32):
+        # Initialize parent MOE model
+        super().__init__(config, action_config, ckpt_path, data_type)
+        
+        # BEV specific config
+        self.num_map_queries = getattr(config, "num_map_queries", 64)
+        self.num_bev_classes = getattr(config, "num_bev_classes", 5)
+        self.bev_output_size = getattr(config, "bev_output_size", (256, 256))
+        self.bev_loss_weight = getattr(config, "bev_loss_weight", 10.0)
+        self.enable_bev_loss = getattr(config, "enable_bev_loss", True)
+        self.map_token_id = getattr(config, "map_token_id", None)
+        
+        # Get hidden size from VLM
+        vlm_hidden_size = self.qwen_ross.config.hidden_size
+        
+        # Learnable map query embeddings
+        self.map_query_embedding = nn.Embedding(
+            self.num_map_queries, vlm_hidden_size
+        ).to(data_type)
+        
+        # BEV prediction head
+        self.bev_head = BEVSemanticHead(
+            d_model=vlm_hidden_size,
+            num_map_queries=self.num_map_queries,
+            num_classes=self.num_bev_classes,
+            output_size=self.bev_output_size,
+        ).to(data_type)
+        
+        print(f"[BEV] Initialized with {self.num_map_queries} queries, {self.num_bev_classes} classes, output {self.bev_output_size}")
+    
+    def forward(
+            self,
+            pre_action: torch.Tensor,
+            action: Optional[torch.Tensor] = None,
+            vlm_input_ids: torch.LongTensor = None,
+            vlm_labels: torch.LongTensor = None,
+            input_ids: torch.LongTensor = None,
+            action_input_ids: torch.LongTensor = None,
+            vlm_attention_mask: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            position_ids: Optional[torch.LongTensor] = None,
+            inputs_embeds: Optional[torch.FloatTensor] = None,
+            labels: Optional[torch.LongTensor] = None,
+            use_cache: Optional[bool] = None,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            pixel_values: Optional[torch.Tensor] = None,
+            pixel_values_videos: Optional[torch.FloatTensor] = None,
+            image_grid_thw: Optional[torch.LongTensor] = None,
+            video_grid_thw: Optional[torch.LongTensor] = None,
+            rope_deltas: Optional[torch.LongTensor] = None,
+            cache_position: Optional[torch.LongTensor] = None,
+            second_per_grid_ts: Optional[torch.Tensor] = None,
+            logits_to_keep: Union[int, torch.Tensor] = 0,
+            # ROSS-specific inputs
+            raw_pixel_values_vae: Optional[torch.Tensor] = None,
+            image_token_masks: Optional[torch.Tensor] = None,
+            action_future_masks: Optional[torch.Tensor] = None,
+            frame_image_counts: Optional[torch.Tensor] = None,
+            return_dict: Optional[bool] = None,
+            vlm_k_rope_cache: Optional[List[torch.Tensor]] = None,
+            vlm_v_cache: Optional[List[torch.Tensor]] = None,
+            vlm_seq_len: Optional[int] = None,
+            token=None,
+            grpo_sample=False,
+            # BEV-specific inputs (placeholders)
+            map_token_masks: Optional[torch.Tensor] = None,        # [B, L] boolean
+            bev_semantic_map_gt: Optional[torch.Tensor] = None,    # [B, H, W] long
+    ) -> Union[Qwen2_5_VLCausalLMOutputWithPast, Qwen2_5_VLROSSOutput]:
+        
+        self.loss_dict.clear()
+        use_cache = False
+        return_dict = return_dict if return_dict is not None else True
+
+        if self.training and not grpo_sample:
+            if input_ids is None:
+                raise ValueError("action_input_ids is required (starts with <boa>) in training")
+            if pre_action is None:
+                raise ValueError("pre_action must be provided to build the state token in training")
+            if vlm_input_ids is None:
+                raise ValueError("Training requires vlm_input_ids / vlm_attention_mask / pre_action")
+
+            B = input_ids.shape[0] if input_ids is not None else inputs_embeds.shape[0]
+            device = input_ids.device if input_ids is not None else inputs_embeds.device
+
+            # Initial VLM embeddings
+            if inputs_embeds is None:
+                vlm_inputs_embeds = self.qwen_ross.model.language_model.embed_tokens(vlm_input_ids)
+            
+            # Build multimodal embeddings (replace image tokens)
+            current_vlm_h = self.build_multimodal_inputs_embeds(vlm_input_ids, pixel_values, vlm_inputs_embeds, image_grid_thw)
+            
+            # ===== BEV: Replace <map> tokens with learnable embeddings =====
+            if map_token_masks is not None and map_token_masks.any():
+                # map_token_masks: [B, L]
+                map_embeds = self.map_query_embedding.weight  # [num_map_queries, H]
+                map_embeds = map_embeds.unsqueeze(0).expand(B, -1, -1)  # [B, num_map_queries, H]
+                map_embeds_flat = map_embeds.reshape(-1, map_embeds.shape[-1])  # [B*num_map_queries, H]
+                
+                # Use masked_scatter to replace
+                map_mask_expanded = map_token_masks.unsqueeze(-1).expand_as(current_vlm_h)
+                current_vlm_h = current_vlm_h.masked_scatter(map_mask_expanded, map_embeds_flat.to(current_vlm_h.dtype))
+
+            vlm_seq_len_local = current_vlm_h.shape[1]
+
+            # Build state + action embeddings
+            state_in = pre_action.view(B, -1).to(self.data_type)
+            state_tok = self.state_projector(state_in).unsqueeze(1)
+
+            action_emb = self.qwen_ross.model.language_model.embed_tokens(input_ids)
+            action_emb = self.action_embed_projector(action_emb)
+            current_action_h = torch.cat([state_tok, action_emb], dim=1)
+            action_len_with_state = current_action_h.size(1)
+
+            num_layers = len(self.qwen_ross.model.language_model.layers)
+            vlm_position_embeddings = self.qwen_ross.model.language_model.rotary_emb(vlm_inputs_embeds, position_ids)
+
+            action_valid_wo_state = (input_ids != self.pad_token_id)
+            action_valid_with_state = torch.cat(
+                [torch.ones(B, 1, dtype=torch.bool, device=device), action_valid_wo_state], dim=1)
+
+            combined_attention_mask_4d = self.create_causal_style_attention_mask(
+                vlm_seq_len=vlm_seq_len_local, action_seq_len=action_len_with_state,
+                vlm_attention_mask_original=vlm_attention_mask, input_ids=vlm_input_ids, 
+                batch_size=B, device=device, dtype=self.data_type, action_is_causal=True,
+                action_attention_mask_1d=action_valid_with_state)
+
+            # Layer-wise processing
+            for layer_idx in range(num_layers):
+                shared_layer = self.shared_layers[layer_idx]
+                shared_layer.vlm_layer.to(device)
+                shared_layer.action_layer.to(device)
+
+                if self.gradient_checkpointing and self.training:
+                    current_vlm_h, current_action_h = self._gradient_checkpointing_func(
+                        shared_layer.__call__,
+                        current_vlm_h, current_action_h, vlm_position_embeddings,
+                        combined_attention_mask_4d, vlm_seq_len_local, action_len_with_state, B,
+                    )
+                else:
+                    current_vlm_h, current_action_h = shared_layer(
+                        current_vlm_h, current_action_h, vlm_position_embeddings,
+                        combined_attention_mask_4d, vlm_seq_len_local, action_len_with_state, B,
+                    )
+
+            # Action loss
+            h_final = self.action_expert.norm(current_action_h)
+            logits = self.action_lm_head(h_final)
+            loss = None
+            if labels is not None:
+                logits_for_loss = logits[:, :-1, :].contiguous()
+                targets = labels.contiguous()
+                loss_fct = CrossEntropyLoss(ignore_index=-100)
+                loss = loss_fct(
+                    logits_for_loss.view(-1, logits_for_loss.size(-1)),
+                    targets.view(-1)
+                )
+                loss = loss * getattr(self, "action_loss_weight", 1.0)
+                self.loss_dict["action_loss"] = float(loss.detach().cpu())
+
+            # VLM action loss
+            if self.vlm_action_loss_weight > 0.0:
+                vlm_final = self.qwen_ross.model.language_model.norm(current_vlm_h)
+                vlm_logits = self.qwen_ross.lm_head(vlm_final)
+                vlm_logits = vlm_logits.float()
+                shift_logits = vlm_logits[..., :-1, :].contiguous()
+                shift_labels = vlm_labels[..., 1:].contiguous()
+                shift_logits = shift_logits.view(-1, self.config.vocab_size)
+                shift_labels = shift_labels.view(-1)
+                shift_labels = shift_labels.to(shift_logits.device)
+                vlm_action_loss = loss_fct(shift_logits, shift_labels)
+                loss = loss + self.vlm_action_loss_weight * vlm_action_loss
+                self.loss_dict["vlm_action_loss"] = float(vlm_action_loss.detach().cpu())
+
+            # ROSS loss
+            if self.vlm_ross_loss_weight > 0.0:
+                if 'vlm_final' not in locals():
+                    vlm_final = self.qwen_ross.model.language_model.norm(current_vlm_h)
+                ross_loss = self.compute_ross_loss_and_update_logs(vlm_final, image_token_masks, action_future_masks, raw_pixel_values_vae)
+                loss = loss + self.vlm_ross_loss_weight * ross_loss
+                self.loss_dict["ross_loss"] = float(ross_loss.detach().cpu())
+
+            # ===== BEV Loss =====
+            bev_pred = None
+            if map_token_masks is not None and map_token_masks.any():
+                # Extract map features from VLM hidden states
+                if 'vlm_final' not in locals():
+                    vlm_final = self.qwen_ross.model.language_model.norm(current_vlm_h)
+                
+                # Extract map hidden states
+                map_hidden = vlm_final[map_token_masks]  # [B*num_map_queries, H]
+                map_hidden = map_hidden.view(B, self.num_map_queries, -1)  # [B, num_map_queries, H]
+                
+                # BEV prediction
+                bev_pred = self.bev_head(map_hidden)  # [B, num_classes, H, W]
+                
+                # Compute BEV loss only if GT is provided
+                if bev_semantic_map_gt is not None and self.enable_bev_loss:
+                    bev_loss = F.cross_entropy(bev_pred, bev_semantic_map_gt.long())
+                    loss = loss + self.bev_loss_weight * bev_loss
+                    self.loss_dict["bev_loss"] = float(bev_loss.detach().cpu())
+
+            if not return_dict:
+                return logits, None, None, loss
+            return CausalLMOutputWithPast(loss=loss, logits=logits, past_key_values=None)
+        else:
+            # Inference path - call parent's inference logic
+            return super().forward(
+                pre_action=pre_action, action=action, vlm_input_ids=vlm_input_ids,
+                vlm_labels=vlm_labels, input_ids=input_ids, action_input_ids=action_input_ids,
+                vlm_attention_mask=vlm_attention_mask, attention_mask=attention_mask,
+                position_ids=position_ids, inputs_embeds=inputs_embeds, labels=labels,
+                use_cache=use_cache, output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states, pixel_values=pixel_values,
+                pixel_values_videos=pixel_values_videos, image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw, rope_deltas=rope_deltas,
+                cache_position=cache_position, second_per_grid_ts=second_per_grid_ts,
+                logits_to_keep=logits_to_keep, raw_pixel_values_vae=raw_pixel_values_vae,
+                image_token_masks=image_token_masks, action_future_masks=action_future_masks,
+                frame_image_counts=frame_image_counts, return_dict=return_dict,
+                vlm_k_rope_cache=vlm_k_rope_cache, vlm_v_cache=vlm_v_cache,
+                vlm_seq_len=vlm_seq_len, token=token, grpo_sample=grpo_sample,
+            )
+
+
 __all__ = [
     "Qwen2_5_VLConfigROSS",
     "Qwen2_5_VLForConditionalGenerationROSS",
@@ -1539,5 +1877,9 @@ __all__ = [
     "Qwen2_5_VLForConditionalGenerationROSS_MOE",
     "QwenPi0SharedLayer",
     "Qwen2_5_VLConfigROSSMOE_ACTIONEXPERT",
-    "Qwen2_5_VLConfigROSSMOE"
+    "Qwen2_5_VLConfigROSSMOE",
+    # BEV
+    "BEVSemanticHead",
+    "Qwen2_5_VLConfigROSSMOE_BEV",
+    "Qwen2_5_VLForConditionalGenerationROSS_MOE_BEV",
 ]

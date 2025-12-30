@@ -2397,3 +2397,495 @@ def make_supervised_data_module_huawei2_vla_ross_moe_multiview4_5kw(tokenizer: t
     train_dataset = LazySupervisedHuawei2VAROSSMOEDataset_Multiview4(tokenizer=tokenizer, data_args=data_args)
     data_collator = DataCollatorForSupervisedVLAMoEDataset(tokenizer=tokenizer)
     return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
+
+
+# ============ BEV Token Setup ============
+
+MAP_TOKEN = "<map>"
+
+def setup_bev_tokens(tokenizer) -> Dict[str, int]:
+    """
+    添加 <map> 特殊token到tokenizer
+    
+    Returns:
+        dict: 包含 map_token_id
+    """
+    existing_special = tokenizer.additional_special_tokens if hasattr(tokenizer, 'additional_special_tokens') else []
+    
+    if MAP_TOKEN not in existing_special:
+        tokenizer.add_special_tokens({"additional_special_tokens": existing_special + [MAP_TOKEN]})
+        rank0_print(f"Added special token: {MAP_TOKEN}")
+    
+    map_token_id = tokenizer.convert_tokens_to_ids(MAP_TOKEN)
+    
+    return {"map_token_id": map_token_id}
+
+
+# ============ BEV Dataset ============
+
+class LazySupervisedHuawei2VAROSSMOEDataset_Multiview4_BEV(LazySupervisedHuawei2VAROSSMOEDataset_Multiview4):
+    """
+    Extended dataset with BEV semantic map support.
+    Adds:
+    - <map> tokens in prompt
+    - BEV semantic map GT generation
+    - map_token_masks for model
+    """
+    
+    def __init__(self, tokenizer: transformers.PreTrainedTokenizer, data_args):
+        super().__init__(tokenizer, data_args)
+        
+        # Setup BEV tokens
+        token_info = setup_bev_tokens(tokenizer)
+        self.map_token_id = token_info["map_token_id"]
+        
+        # BEV config
+        self.num_map_queries = getattr(data_args, "num_map_queries", 64)
+        self.num_bev_classes = getattr(data_args, "num_bev_classes", 5)
+        self.bev_pixel_width = getattr(data_args, "bev_pixel_width", 256)
+        self.bev_pixel_height = getattr(data_args, "bev_pixel_height", 256)
+        
+        # Initialize GT config for BEV generation
+        from hwcode.transfuser_gt_utils_ads import ADSGTConfig, compute_bev_semantic_map_ads
+        self.gt_config = ADSGTConfig(
+            bev_pixel_width=self.bev_pixel_width,
+            bev_pixel_height=self.bev_pixel_height,
+            num_bev_classes=self.num_bev_classes,
+            lidar_min_x=-32.0,
+            lidar_max_x=32.0,
+            lidar_min_y=-32.0,
+            lidar_max_y=32.0,
+            use_fov_filter=False,
+        )
+        self.compute_bev_semantic_map_ads = compute_bev_semantic_map_ads
+        
+        rank0_print(f"[BEV Dataset] map_token_id={self.map_token_id}, num_queries={self.num_map_queries}, classes={self.num_bev_classes}")
+    
+    def _build_conversation_for_pairs_bev(self, pairs_prompts: List[Tuple[str, str]]):
+        """
+        Build conversation with <map> tokens added to current frame prompt.
+        Each pair: (pre_prompt, cur_prompt)
+        """
+        conv = []
+        map_tokens_str = MAP_TOKEN * self.num_map_queries
+        
+        for pre_p, cur_p in pairs_prompts:
+            conv.extend([
+                {"from": "user", "value": f"<image><image><image><image>{pre_p}"},
+                {"from": "assistant", "value": ""},
+                # Add <map> tokens to current frame
+                {"from": "user", "value": f"<image><image><image><image>{cur_p} {map_tokens_str}"},
+                {"from": "assistant", "value": ""},
+            ])
+        return [conv]
+    
+    def compute_bev_gt(self, cur_pkl_data) -> Optional[torch.Tensor]:
+        """
+        Compute BEV semantic map GT from pkl data.
+        
+        Returns:
+            bev_semantic_map: [H, W] tensor with class indices, or None if failed
+        """
+        try:
+            # Convert object_feat to obj_label format
+            obj_label = self._convert_object_feat_to_obj_label(
+                cur_pkl_data.get('object_feat', None), 
+                exclude_ego=True
+            )
+            
+            if obj_label is None or len(obj_label) == 0:
+                # Return background-only BEV if no objects
+                return torch.zeros(self.bev_pixel_height, self.bev_pixel_width, dtype=torch.long)
+            
+            # Get static objects
+            static_obj_feat = cur_pkl_data.get('static_obj_feat', None)
+            static_obj_mask = cur_pkl_data.get('static_obj_mask', None)
+            
+            if static_obj_feat is not None:
+                static_obj_feat = np.array(static_obj_feat)
+            if static_obj_mask is not None:
+                static_obj_mask = np.array(static_obj_mask)
+            
+            # Compute BEV semantic map
+            bev_map = self.compute_bev_semantic_map_ads(
+                obj_labels=obj_label,
+                config=self.gt_config,
+                static_obj_feat=static_obj_feat,
+                static_obj_mask=static_obj_mask,
+            )
+            
+            return torch.tensor(bev_map, dtype=torch.long)
+            
+        except Exception as e:
+            rank0_print(f"[BEV GT] Failed to compute: {e}")
+            return torch.zeros(self.bev_pixel_height, self.bev_pixel_width, dtype=torch.long)
+    
+    def get_item(self, cur_idx, scene_len, scene):
+        """Override parent's get_item to add BEV data."""
+        # Call parent's get_item
+        pre_idx = cur_idx - 2
+        if scene_len <= cur_idx:
+            raise ValueError("Clip is too short!")  
+        cur_img_path, cur_pkl_path, cur_command_pkl_path = scene[cur_idx]
+        pre_img_path, pre_pkl_path, pre_command_pkl_path = scene[pre_idx]
+        _, _15_cur_pkl_path, _ = scene[(cur_idx-3)]
+        _, _15_pre_pkl_path, _ = scene[(pre_idx-3)]
+
+        cur_pkl_data, extra_cur_pkl_data = self.get_pkl(cur_pkl_path)
+        cur_command_data = self.load_pickle(cur_command_pkl_path, open_fn=mox.file.File)
+        _15_cur_data, _ = self.get_pkl(_15_cur_pkl_path)
+        pre_pkl_data, extra_pre_pkl_data = self.get_pkl(pre_pkl_path)
+        pre_command_data = self.load_pickle(pre_command_pkl_path, open_fn=mox.file.File)
+        _15_pre_data, _ = self.get_pkl(_15_pre_pkl_path)
+
+        if cur_pkl_data is None or pre_pkl_data is None or cur_command_data is None or pre_command_data is None or _15_cur_data is None or _15_pre_data is None:
+            raise ValueError("pkl is empty!")     
+
+        # Prepare containers
+        all_images: List[torch.Tensor] = []
+        all_image_thw: List[torch.Tensor] = []
+        grid_thw_image_flat: List[int] = []
+        action_segments: List[torch.Tensor] = []
+        action_roles: List[str] = []
+
+        cur_action_fut = cur_pkl_data['full_gt_traj'][0,:10,:3]
+        cur_action_pre = _15_cur_data['full_gt_traj'][0,:3,:3]
+        pre_action_fut = pre_pkl_data['full_gt_traj'][0,:2,:3]
+        pre_action_pre = _15_pre_data['full_gt_traj'][0,:3,:3]
+
+        pre_actions_array = self.norm_rel_traj_pre_and_future(pre_action_pre, pre_action_fut)
+        actions_array = self.norm_rel_traj_pre_and_future(cur_action_pre, cur_action_fut)
+
+        cur_tbt_prompt = self.build_tbt_features(cur_command_data["tbt_lane_feature_from_bag"][0], cur_command_data["tbt_feature_from_bag"][0])
+        pre_tbt_prompt = self.build_tbt_features(pre_command_data["tbt_lane_feature_from_bag"][0], pre_command_data["tbt_feature_from_bag"][0])
+
+        # [BEV Debug] visualization
+        if getattr(self, 'debug_bev', False) and cur_pkl_data is not None:
+            self.visualize_bev(cur_pkl_data, sample_id=f"{cur_idx}")
+
+        # Images processing (same as parent)
+        pre_image_raw = cur_image_raw = None
+        left_pre_image_raw = left_image_raw = None
+        right_pre_image_raw = right_image_raw = None
+        back_pre_image_raw = back_image_raw = None
+
+        pre_result = self.process_image_unified(pre_img_path, cam_id=1)
+        left_pre_result = self.process_image_unified(pre_img_path, cam_id=5)
+        right_pre_result = self.process_image_unified(pre_img_path, cam_id=6)
+        back_pre_result = self.process_image_unified(pre_img_path, cam_id=8)
+
+        cur_result = self.process_image_unified(cur_img_path, cam_id=1)
+        left_result = self.process_image_unified(cur_img_path, cam_id=5)
+        right_result = self.process_image_unified(cur_img_path, cam_id=6)
+        back_result = self.process_image_unified(cur_img_path, cam_id=8)
+
+        if self.return_raw_vae:
+            pre_img, pre_thw, pre_image_raw = pre_result
+            left_pre_img, left_pre_thw, left_pre_image_raw = left_pre_result
+            right_pre_img, right_pre_thw, right_pre_image_raw = right_pre_result
+            back_pre_img, back_pre_thw, back_pre_image_raw = back_pre_result
+
+            cur_img, cur_thw, cur_image_raw = cur_result
+            left_img, left_thw, left_image_raw = left_result
+            right_img, right_thw, right_image_raw = right_result
+            back_img, back_thw, back_image_raw = back_result
+        else:
+            pre_img, pre_thw = pre_result
+            left_pre_img, left_pre_thw = left_pre_result
+            right_pre_img, right_pre_thw = right_pre_result
+            back_pre_img, back_pre_thw = back_pre_result
+
+            cur_img, cur_thw = cur_result
+            left_img, left_thw = left_result
+            right_img, right_thw = right_result
+            back_img, back_thw = back_result
+
+        if pre_img is not None and pre_thw is not None:
+            all_images.append(left_pre_img)
+            all_image_thw.append(left_pre_thw)
+            grid_thw_image_flat.extend(self._grid_merge_count(left_pre_thw))
+        
+            all_images.append(pre_img)
+            all_image_thw.append(pre_thw)
+            grid_thw_image_flat.extend(self._grid_merge_count(pre_thw))
+
+            all_images.append(right_pre_img)
+            all_image_thw.append(right_pre_thw)
+            grid_thw_image_flat.extend(self._grid_merge_count(right_pre_thw))
+
+            all_images.append(back_pre_img)
+            all_image_thw.append(back_pre_thw)
+            grid_thw_image_flat.extend(self._grid_merge_count(back_pre_thw))
+
+        if cur_img is not None and cur_thw is not None:
+            all_images.append(left_img)
+            all_image_thw.append(left_thw)
+            grid_thw_image_flat.extend(self._grid_merge_count(left_thw))
+
+            all_images.append(cur_img)
+            all_image_thw.append(cur_thw)
+            grid_thw_image_flat.extend(self._grid_merge_count(cur_thw))
+
+            all_images.append(right_img)
+            all_image_thw.append(right_thw)
+            grid_thw_image_flat.extend(self._grid_merge_count(right_thw))
+
+            all_images.append(back_img)
+            all_image_thw.append(back_thw)
+            grid_thw_image_flat.extend(self._grid_merge_count(back_thw))
+
+        # Actions processing (same as parent)
+        if self.use_actions and actions_array is not None:
+            pre_hist, pre_fut = self._sample_actions_window(pre_actions_array, hist_index=3)
+            if self.use_previous_actions and pre_hist is not None:
+                action_segments.append(pre_hist)
+                action_roles.append("user")
+            if pre_fut is not None:
+                action_segments.append(pre_fut)
+                action_roles.append("assistant")
+
+            cur_hist, cur_fut = self._sample_actions_window(actions_array, hist_index=3)
+            if self.use_previous_actions and cur_hist is not None:
+                action_segments.append(cur_hist)
+                action_roles.append("user")
+            if cur_fut is not None:
+                action_segments.append(cur_fut)
+                action_roles.append("assistant")
+
+        # ===== BEV: Build conversation with <map> tokens =====
+        sources = self._build_conversation_for_pairs_bev([(pre_tbt_prompt, cur_tbt_prompt)])
+
+        data_dict = preprocess_qwen_2_visual_vla_sources(
+            sources=sources,
+            tokenizer=self.tokenizer,
+            grid_thw_image=grid_thw_image_flat,
+            action_segments=action_segments if len(action_segments) > 0 else None,
+            action_roles=action_roles if len(action_roles) > 0 else None,
+            return_masks=self.return_masks,
+        )
+
+        action_ids_tensor = cur_fut
+        MAX_AR_LEN = 24
+        pad_id = self.tokenizer.pad_token_id
+        if action_ids_tensor.shape[0] >= MAX_AR_LEN:
+            action_fixed = action_ids_tensor[:MAX_AR_LEN].clone()
+            action_fixed[-1] = self.eoa_token_id
+            labels_fixed = action_fixed.clone()
+        else:
+            pad_len = MAX_AR_LEN - action_ids_tensor.shape[0]
+            action_fixed = torch.cat([
+                action_ids_tensor,
+                torch.full((pad_len,), pad_id, dtype=action_ids_tensor.dtype)
+            ], dim=0)
+            labels_fixed = torch.cat([
+                action_ids_tensor,
+                torch.full((pad_len,), IGNORE_INDEX, dtype=torch.long)
+            ], dim=0)
+        
+        data_dict["vlm_input_ids"] = data_dict["input_ids"]
+        data_dict["vlm_labels"] = data_dict["labels"]
+
+        data_dict["input_ids"] = action_fixed
+        data_dict["action_input_ids"] = action_fixed     
+        data_dict['labels'] = labels_fixed
+    
+        # Position ids
+        position_ids, _ = self.get_rope_index(
+            self.data_args.image_processor.merge_size,
+            data_dict["vlm_input_ids"],
+            image_grid_thw=torch.stack(all_image_thw, dim=0) if len(all_image_thw) > 0 else None,
+            video_grid_thw=None,
+            second_per_grid_ts=None,
+        )
+
+        data_dict["position_ids"] = position_ids
+
+        if len(all_images) > 0:
+            data_dict["pixel_values"] = torch.cat(all_images, dim=0)
+            data_dict["image_grid_thw"] = torch.cat([thw.unsqueeze(0) for thw in all_image_thw], dim=0)
+
+            if self.return_raw_vae:
+                T, N = 2, 4
+                raw_shape = cur_image_raw.shape
+                raw_tensor = torch.zeros((T, N) + raw_shape, dtype=data_dict["pixel_values"].dtype)
+                raw_tensor[0, 0] = left_pre_image_raw
+                raw_tensor[0, 1] = pre_image_raw
+                raw_tensor[0, 2] = right_pre_image_raw
+                raw_tensor[0, 3] = back_pre_image_raw
+
+                raw_tensor[1, 0] = left_image_raw
+                raw_tensor[1, 1] = cur_image_raw
+                raw_tensor[1, 2] = right_image_raw
+                raw_tensor[1, 3] = back_image_raw
+                data_dict["raw_pixel_values_vae"] = raw_tensor
+                data_dict["frame_image_counts"] = torch.tensor([1, 1, 1, 1, 1, 1, 1, 1], dtype=torch.long)
+
+        # Action expert inputs
+        data_dict["action"] = torch.tensor(np.array(actions_array)[3:, :], dtype=torch.float)
+        data_dict["pre_action"] = torch.tensor(np.array(actions_array)[:3, :], dtype=torch.float)
+        
+        # ===== BEV: Add map_token_masks and bev_semantic_map_gt =====
+        vlm_input_ids = data_dict["vlm_input_ids"]
+        if vlm_input_ids.dim() == 2:
+            vlm_input_ids = vlm_input_ids.squeeze(0)
+        map_token_masks = (vlm_input_ids == self.map_token_id)
+        data_dict["map_token_masks"] = map_token_masks  # [L]
+        
+        # Compute BEV GT
+        bev_semantic_map_gt = self.compute_bev_gt(cur_pkl_data)
+        data_dict["bev_semantic_map_gt"] = bev_semantic_map_gt  # [H, W]
+        
+        return data_dict
+
+
+# ============ BEV Collator ============
+
+@dataclass
+class DataCollatorForSupervisedVLAMoEBEVDataset(object):
+    """Collate examples for supervised VLA fine-tuning with BEV support."""
+    tokenizer: transformers.PreTrainedTokenizer
+
+    def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
+        vlm_input_ids, vlm_labels, position_ids = tuple(
+            [instance[key] for instance in instances]
+            for key in ("vlm_input_ids", "vlm_labels", "position_ids")
+        )
+        vlm_input_ids = [ids.squeeze(0) for ids in vlm_input_ids]
+        vlm_labels = [ids.squeeze(0) for ids in vlm_labels]
+        vlm_input_ids = torch.nn.utils.rnn.pad_sequence(
+            vlm_input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id
+        )
+        vlm_labels = torch.nn.utils.rnn.pad_sequence(
+            vlm_labels, batch_first=True, padding_value=IGNORE_INDEX
+        )
+        position_ids = pad_and_cat(position_ids)
+        vlm_input_ids = vlm_input_ids[:, : self.tokenizer.model_max_length]
+        vlm_labels = vlm_labels[:, : self.tokenizer.model_max_length]
+        position_ids = position_ids[:, : self.tokenizer.model_max_length]
+        
+        batch = dict(
+            vlm_input_ids=vlm_input_ids,
+            vlm_labels=vlm_labels,
+            vlm_attention_mask=vlm_input_ids.ne(self.tokenizer.pad_token_id),
+        )
+        
+        # Handle images/videos
+        images = list(instance["pixel_values"] for instance in instances if "pixel_values" in instance)
+        videos = list(instance["pixel_values_videos"] for instance in instances if "pixel_values_videos" in instance)
+        
+        if len(images) != 0:
+            concat_images = torch.cat([image for image in images], dim=0)
+            grid_thw = [instance["image_grid_thw"] for instance in instances if "image_grid_thw" in instance]
+            grid_thw = torch.cat(grid_thw, dim=0)
+        else:
+            concat_images = None
+            grid_thw = None
+
+        if len(videos) != 0:
+            concat_videos = torch.cat([video for video in videos], dim=0)
+            video_grid_thw = [instance["video_grid_thw"] for instance in instances if "video_grid_thw" in instance]
+            video_grid_thw = torch.cat(video_grid_thw, dim=0)
+        else:
+            concat_videos = None
+            video_grid_thw = None
+
+        batch["pixel_values"] = concat_images
+        batch["image_grid_thw"] = grid_thw
+        batch["pixel_values_videos"] = concat_videos
+        batch["video_grid_thw"] = video_grid_thw
+        batch["position_ids"] = position_ids
+        
+        # Handle raw VAE pixel values and frame counts
+        raw_pixel_values_vae = [instance["raw_pixel_values_vae"] for instance in instances if "raw_pixel_values_vae" in instance]
+        frame_image_counts = [instance["frame_image_counts"] for instance in instances if "frame_image_counts" in instance]
+        
+        if len(raw_pixel_values_vae) != 0:
+            batch["raw_pixel_values_vae"] = torch.cat(raw_pixel_values_vae, dim=1)
+        else:
+            batch["raw_pixel_values_vae"] = None
+            
+        if len(frame_image_counts) != 0:
+            batch["frame_image_counts"] = torch.stack(frame_image_counts, dim=0)
+        else:
+            batch["frame_image_counts"] = None
+        
+        # Handle image token masks and action future masks
+        image_token_masks = [instance["image_token_masks"] for instance in instances if "image_token_masks" in instance]
+        action_future_masks = [instance["action_future_masks"] for instance in instances if "action_future_masks" in instance]
+        
+        if len(image_token_masks) != 0 and len(action_future_masks) != 0:
+            max_img_len = max(mask.shape[-1] for mask in image_token_masks)
+            max_act_len = max(mask.shape[-1] for mask in action_future_masks)
+            target_length = max(max_img_len, max_act_len)
+
+            padded_image_masks = []
+            padded_action_masks = []
+            for img_mask, act_mask in zip(image_token_masks, action_future_masks):
+                pad_img = target_length - img_mask.shape[-1]
+                pad_act = target_length - act_mask.shape[-1]
+
+                if pad_img > 0:
+                    img_mask = torch.nn.functional.pad(img_mask, (0, pad_img), mode='constant', value=0)
+                if pad_act > 0:
+                    act_mask = torch.nn.functional.pad(act_mask, (0, pad_act), mode='constant', value=0)
+
+                padded_image_masks.append(img_mask)
+                padded_action_masks.append(act_mask)
+
+            batch["image_token_masks"] = torch.cat(padded_image_masks, dim=0)
+            batch["action_future_masks"] = torch.cat(padded_action_masks, dim=0)
+        else:
+            batch["image_token_masks"] = None if len(image_token_masks) == 0 else image_token_masks
+            batch["action_future_masks"] = None if len(action_future_masks) == 0 else action_future_masks
+
+        # Action expert fields
+        input_ids_stack = [instance["input_ids"] for instance in instances if "input_ids" in instance]
+        labels_stack = [instance["labels"] for instance in instances if "labels" in instance]
+        pre_action_stack = [instance["pre_action"] for instance in instances if "pre_action" in instance]
+        action_stack = [instance["action"] for instance in instances if "action" in instance]
+        cmd_stack = [instance["cmd"] for instance in instances if "cmd" in instance]
+
+        if len(input_ids_stack) > 0:
+            batch["input_ids"] = torch.stack(input_ids_stack, dim=0)
+        if len(labels_stack) > 0:
+            batch["labels"] = torch.stack(labels_stack, dim=0)        
+        if len(pre_action_stack) > 0:
+            batch["pre_action"] = torch.stack(pre_action_stack, dim=0)
+        if len(action_stack) > 0:
+            batch["action"] = torch.stack(action_stack, dim=0)
+        if len(cmd_stack) > 0:
+            batch["cmd"] = torch.stack(cmd_stack, dim=0)
+
+        # ===== BEV: Handle map_token_masks =====
+        map_token_masks = [instance["map_token_masks"] for instance in instances if "map_token_masks" in instance]
+        if len(map_token_masks) != 0:
+            # Pad to same length
+            max_len = vlm_input_ids.shape[1]
+            padded_map_masks = []
+            for mask in map_token_masks:
+                if mask.dim() == 1:
+                    mask = mask.unsqueeze(0)
+                pad_len = max_len - mask.shape[-1]
+                if pad_len > 0:
+                    mask = torch.nn.functional.pad(mask, (0, pad_len), value=False)
+                mask = mask[:, :max_len]
+                padded_map_masks.append(mask)
+            batch["map_token_masks"] = torch.cat(padded_map_masks, dim=0)  # [B, L]
+        else:
+            batch["map_token_masks"] = None
+
+        # ===== BEV: Handle bev_semantic_map_gt =====
+        bev_gt = [instance["bev_semantic_map_gt"] for instance in instances if "bev_semantic_map_gt" in instance]
+        if len(bev_gt) != 0 and all(gt is not None for gt in bev_gt):
+            batch["bev_semantic_map_gt"] = torch.stack(bev_gt, dim=0)  # [B, H, W]
+        else:
+            batch["bev_semantic_map_gt"] = None
+
+        return batch
+
+
+def make_supervised_data_module_huawei2_vla_ross_moe_bev_5kw(tokenizer: transformers.PreTrainedTokenizer, data_args) -> Dict:
+    """Make dataset and collator with BEV support for supervised fine-tuning."""
+    train_dataset = LazySupervisedHuawei2VAROSSMOEDataset_Multiview4_BEV(tokenizer=tokenizer, data_args=data_args)
+    data_collator = DataCollatorForSupervisedVLAMoEBEVDataset(tokenizer=tokenizer)
+    return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
