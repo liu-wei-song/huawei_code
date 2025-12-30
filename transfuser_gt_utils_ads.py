@@ -392,14 +392,14 @@ def _draw_polylines(
     closed: bool = False
 ) -> None:
     """
-    通用的多段线绘制函数
+    通用的多段线绘制函数 (对齐 vis_utils.py 的绘制方式)
 
     Args:
         bev_map: BEV语义图
         feat: shape (N, P, 2) 或 (N, P, 3) - N条线，每条有P个点
               如果是3维，只取前两维 [x, y]
         mask: shape (N, P) 或 (N,) - 有效性mask
-              - (N, P): 每个点的mask，判断每条线是否有足够有效点
+              - (N, P): 每个点的mask
               - (N,): 每条线的mask
         label: 类别标签
         config: 配置
@@ -407,11 +407,11 @@ def _draw_polylines(
         scale: 分辨率放大倍数
         closed: 是否闭合
     """
-    # ✅ 适配 (N, P, 3) 格式，只取前两维
+    # 适配 (N, P, 3) 格式，只取前两维
     if feat.ndim == 3 and feat.shape[-1] == 3:
         feat = feat[..., :2]  # (N, P, 2)
-    
-    # ✅ 处理 mask - 判断每条线是否有效
+
+    # 处理 mask - 判断每条线是否有效
     if mask.ndim == 2:  # mask shape: (N, P)
         # 对每条线，检查是否有足够的有效点
         line_valid = mask.sum(axis=-1) >= 2  # 至少2个有效点
@@ -420,31 +420,41 @@ def _draw_polylines(
     else:
         line_valid = np.ones(feat.shape[0], dtype=bool)
 
+    H = config.bev_pixel_height * scale
+    W = config.bev_pixel_width * scale
+    pixel_size = config.bev_pixel_size / scale
+
     for i in range(feat.shape[0]):
         if not line_valid[i]:
             continue
 
         points = feat[i]  # (P, 2)
-        
-        # ✅ 如果有点级mask，使用它来过滤点
-        if mask.ndim == 2:
-            point_mask = mask[i].astype(bool)  # (P,)
-            points = points[point_mask]  # 只保留有效点
-        
-        # 过滤距离太小的点（padding）
-        valid_mask = np.linalg.norm(points, axis=-1) > 0.01
-        valid_points = points[valid_mask]
-        
-        if len(valid_points) < 2:
-            continue
 
-        # 转换为像素坐标
-        pixel_coords = _world_to_pixel_array(valid_points, config, scale)
+        # 对齐 vis_utils.py: 直接遍历相邻点逐一连线，不过滤 padding
+        # 这样可以保证线条连续性
+        for j in range(points.shape[0] - 1):
+            p1 = points[j]      # [x, y]
+            p2 = points[j + 1]  # [x, y]
 
-        # 绘制线条（添加抗锯齿效果）
-        cv2.polylines(bev_map, [pixel_coords], isClosed=closed,
-                      color=int(label), thickness=max(1, thickness * scale),
-                      lineType=cv2.LINE_AA)  # ✨ 抗锯齿
+            # 跳过无效点对 (两个点都是零/padding)
+            if np.linalg.norm(p1) < 0.01 and np.linalg.norm(p2) < 0.01:
+                continue
+
+            # 如果有点级 mask，检查这两个点是否都有效
+            if mask.ndim == 2:
+                if not mask[i, j] or not mask[i, j + 1]:
+                    continue
+
+            # 世界坐标转像素坐标 (ego在中心)
+            # x正向前 -> row减小, y正向左 -> col减小
+            row1 = int(H / 2 - p1[0] / pixel_size)
+            col1 = int(W / 2 - p1[1] / pixel_size)
+            row2 = int(H / 2 - p2[0] / pixel_size)
+            col2 = int(W / 2 - p2[1] / pixel_size)
+
+            # 绘制线段 (对齐 vis_utils.py 的 cv2.line)
+            cv2.line(bev_map, (col1, row1), (col2, row2),
+                     int(label), max(1, thickness * scale), cv2.LINE_AA)
 
 
 def compute_bev_semantic_map_ads(
