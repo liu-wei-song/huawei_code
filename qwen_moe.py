@@ -1846,6 +1846,11 @@ class Qwen2_5_VLForConditionalGenerationROSS_MOE_BEV(Qwen2_5_VLForConditionalGen
                     loss = loss + self.bev_loss_weight * bev_loss
                     self.loss_dict["bev_loss"] = float(bev_loss.detach().cpu())
 
+                # Save BEV prediction and GT for TensorBoard visualization
+                self.loss_dict["bev_pred"] = bev_pred[0].detach().cpu()  # [C, H, W]
+                if bev_semantic_map_gt is not None:
+                    self.loss_dict["bev_gt"] = bev_semantic_map_gt[0].detach().cpu()  # [H, W]
+
             if not return_dict:
                 return logits, None, None, loss
             return CausalLMOutputWithPast(loss=loss, logits=logits, past_key_values=None)
