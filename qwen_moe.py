@@ -19,6 +19,34 @@ import math
 import time
 from transformers.generation.utils import GenerationMixin
 
+
+def focal_loss(logits, targets, alpha=0.25, gamma=2.0, ignore_index=-100, reduction='mean'):
+    """
+    Focal Loss for multi-class classification.
+
+    Args:
+        logits: [B, C, H, W] 预测 logits
+        targets: [B, H, W] 真值类别索引
+        alpha: 平衡因子
+        gamma: 聚焦参数，越大对难样本关注越多
+        ignore_index: 忽略的类别索引（如背景类设为0则忽略背景）
+        reduction: 'mean', 'sum', 或 'none'
+    """
+    ce_loss = F.cross_entropy(logits, targets, reduction='none', ignore_index=ignore_index)  # [B, H, W]
+    pt = torch.exp(-ce_loss)  # 预测正确的概率
+    focal_weight = alpha * (1 - pt) ** gamma
+    loss = focal_weight * ce_loss
+
+    if reduction == 'mean':
+        # 只对非忽略像素求平均
+        valid_mask = (targets != ignore_index)
+        if valid_mask.sum() > 0:
+            return loss[valid_mask].mean()
+        return loss.mean()
+    elif reduction == 'sum':
+        return loss.sum()
+    return loss
+
 from .modeling_qwen2_5_vl import (
     Qwen2_5_VLForConditionalGeneration,
     Qwen2_5_VLCausalLMOutputWithPast,
@@ -1611,6 +1639,7 @@ class Qwen2_5_VLConfigROSSMOE_BEV(PretrainedConfig):
         bev_output_size: Tuple[int, int] = (256, 256),
         bev_loss_weight: float = 10.0,
         enable_bev_loss: bool = True,
+        bev_ignore_background: bool = False,  # 是否忽略背景类(index=0)的loss
         map_token_id: Optional[int] = None,
         **kwargs
     ):
@@ -1630,6 +1659,7 @@ class Qwen2_5_VLConfigROSSMOE_BEV(PretrainedConfig):
         self.bev_output_size = bev_output_size
         self.bev_loss_weight = bev_loss_weight
         self.enable_bev_loss = enable_bev_loss
+        self.bev_ignore_background = bev_ignore_background
         self.map_token_id = map_token_id
 
 
@@ -1654,6 +1684,7 @@ class Qwen2_5_VLForConditionalGenerationROSS_MOE_BEV(Qwen2_5_VLForConditionalGen
         self.bev_output_size = getattr(config, "bev_output_size", (256, 256))
         self.bev_loss_weight = getattr(config, "bev_loss_weight", 10.0)
         self.enable_bev_loss = getattr(config, "enable_bev_loss", True)
+        self.bev_ignore_background = getattr(config, "bev_ignore_background", False)
         self.map_token_id = getattr(config, "map_token_id", None)
         
         # Get hidden size from VLM
@@ -1842,7 +1873,8 @@ class Qwen2_5_VLForConditionalGenerationROSS_MOE_BEV(Qwen2_5_VLForConditionalGen
                 
                 # Compute BEV loss only if GT is provided
                 if bev_semantic_map_gt is not None and self.enable_bev_loss:
-                    bev_loss = F.cross_entropy(bev_pred, bev_semantic_map_gt.long())
+                    ignore_idx = 0 if self.bev_ignore_background else -100
+                    bev_loss = focal_loss(bev_pred, bev_semantic_map_gt.long(), alpha=0.25, gamma=2.0, ignore_index=ignore_idx)
                     loss = loss + self.bev_loss_weight * bev_loss
                     self.loss_dict["bev_loss"] = float(bev_loss.detach().cpu())
 
